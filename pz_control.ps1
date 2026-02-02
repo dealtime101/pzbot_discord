@@ -2,8 +2,10 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)]
-  [ValidateSet("save","stop","start","restart","status","players")]
-  [string]$Action
+  [ValidateSet("save","stop","start","restart","status","players","say")]
+  [string]$Action,
+
+  [string]$Message = ""
 )
 
 Set-StrictMode -Version Latest
@@ -238,5 +240,28 @@ switch ($Action) {
     if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
     Write-Out "OK"
     exit 0
+  }
+  "say" {
+    $proc = Get-PZServerProcess
+    if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+      Write-Out "ERROR: Message is required"
+      exit 2
+    }
+
+    # Escape quotes for safety
+    $msg = $Message.Replace('"','\"')
+
+    try {
+      # Project Zomboid supports 'servermsg' in many setups.
+      # If your server uses a different command, we can adjust.
+      $raw = Invoke-Mcrcon "servermsg `"$msg`""
+      Write-Out "OK"
+      exit 0
+    } catch {
+      Write-Out ("ERROR: " + $_.Exception.Message)
+      exit 2
+    }
   }
 }

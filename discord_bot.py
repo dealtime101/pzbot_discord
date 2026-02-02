@@ -229,8 +229,11 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-async def run_control(action: str) -> tuple[int, str]:
-    return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_CONTROL_PS1, ["-Action", action])
+async def run_control(action: str, extra_args: list[str] | None = None) -> tuple[int, str]:
+    args = ["-Action", action]
+    if extra_args:
+        args.extend(extra_args)
+    return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_CONTROL_PS1, args)
 
 
 async def run_workshop_check() -> tuple[int, str]:
@@ -455,6 +458,32 @@ async def pz_revoke(i: discord.Interaction, user: discord.Member):
     await i.response.send_message(
         embed=make_embed("Confirmation required", f"Revoke PZ role from {user.mention}?", ok=None),
         view=view,
+        ephemeral=True,
+    )
+
+@tree.command(
+    name="pz_say",
+    description="Broadcast a message in-game to all players (admin)",
+    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
+)
+@app_commands.describe(message="Message to broadcast in-game")
+async def pz_say(i: discord.Interaction, message: str):
+    if await require_admin(cfg, i) is None:
+        return
+
+    await i.response.defer(ephemeral=True)
+
+    # Optional: limit message length
+    if len(message) > 200:
+        await i.followup.send(embed=make_embed("PZ — Say", "Message too long (max 200 chars).", ok=False), ephemeral=True)
+        return
+
+    code, out = await run_control("say", ["-Message", message])
+    ok = (code == 0) and ("ERROR" not in out.upper())
+    log_action(i, "say", code, out)
+
+    await i.followup.send(
+        embed=make_embed("PZ — Say", "✅ Message sent in-game." if ok else f"❌ Failed: `{out}`", ok=ok),
         ephemeral=True,
     )
 
