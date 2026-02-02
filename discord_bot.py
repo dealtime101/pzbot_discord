@@ -1,5 +1,6 @@
 ﻿# discord_bot.py
 from __future__ import annotations
+
 import re
 import asyncio
 import logging
@@ -20,6 +21,11 @@ def setup_logging(cfg: Config) -> logging.Logger:
 
     logger = logging.getLogger("pzbot")
     logger.setLevel(logging.INFO)
+
+    # Avoid duplicate handlers on restarts / reloads
+    if logger.handlers:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -65,8 +71,6 @@ async def run_powershell_script(ps_exe: str, script_path: str, args: list[str]) 
 
 
 def make_embed(title: str, description: str, ok: bool | None = None) -> discord.Embed:
-    # No explicit colors requested; Discord default is fine; but embeds look better with color.
-    # We'll use minimal, predictable colors without being flashy.
     if ok is True:
         color = 0x2ecc71
     elif ok is False:
@@ -83,11 +87,12 @@ def user_tag(i: discord.Interaction) -> str:
     u = i.user
     return f"{u.name}({u.id})"
 
+
 def parse_status_with_players(out: str) -> tuple[str, str]:
     t = (out or "").strip()
+    up = t.upper()
 
     status = "UNKNOWN"
-    up = t.upper()
     if "RUNNING" in up:
         status = "RUNNING"
     elif "STOPPED" in up:
@@ -137,7 +142,11 @@ async def require_admin(cfg: Config, i: discord.Interaction) -> Optional[discord
     m = await get_member(i)
     if m is None:
         await i.response.send_message(
-            embed=make_embed("Accès refusé", "Impossible de résoudre le membre. Vérifie **Server Members Intent**.", ok=False),
+            embed=make_embed(
+                "Access denied",
+                "Unable to resolve member. Enable **Server Members Intent** in the Discord Developer Portal.",
+                ok=False,
+            ),
             ephemeral=True,
         )
         return None
@@ -146,7 +155,7 @@ async def require_admin(cfg: Config, i: discord.Interaction) -> Optional[discord
         return m
 
     await i.response.send_message(
-        embed=make_embed("Accès refusé", "Tu n’as pas les permissions requises pour cette commande.", ok=False),
+        embed=make_embed("Access denied", "You don’t have permission to use this command.", ok=False),
         ephemeral=True,
     )
     return None
@@ -184,30 +193,28 @@ class ConfirmView(discord.ui.View):
         self.on_confirm = on_confirm
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only the same user can confirm
         if interaction.user.id != self.pending.interaction_user_id:
             await interaction.response.send_message(
-                embed=make_embed("Confirmation", "Seul l’auteur de la commande peut confirmer.", ok=False),
+                embed=make_embed("Confirmation", "Only the command author can confirm.", ok=False),
                 ephemeral=True,
             )
             return False
         return True
 
-    @discord.ui.button(label="Confirmer", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.on_confirm(interaction)
         self.stop()
 
-    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
-            embed=make_embed("Annulé", "Action annulée.", ok=None),
+            embed=make_embed("Cancelled", "Action cancelled.", ok=None),
             view=None,
         )
         self.stop()
 
     async def on_timeout(self):
-        # If message still exists, it will just show view disabled.
         pass
 
 
@@ -227,7 +234,6 @@ async def run_control(action: str) -> tuple[int, str]:
 
 
 async def run_workshop_check() -> tuple[int, str]:
-    # workshop script uses DISCORD_WEBHOOK_URL env var
     return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.WORKSHOP_CHECK_PS1, [])
 
 
@@ -236,17 +242,26 @@ async def update_presence_loop():
     while not client.is_closed():
         try:
             code, out = await run_control("status")
-            status = (out or "").strip().upper()
-            if "RUNNING" in status:
-                await client.change_presence(activity=discord.Game("PZ: RUNNING"), status=discord.Status.online)
-            elif "STOPPED" in status:
-                await client.change_presence(activity=discord.Game("PZ: STOPPED"), status=discord.Status.idle)
+            status, players = parse_status_with_players(out)
+
+            if status == "RUNNING":
+                await client.change_presence(
+                    activity=discord.Game(f"PZ: RUNNING ({players})"),
+                    status=discord.Status.online,
+                )
+            elif status == "STOPPED":
+                await client.change_presence(
+                    activity=discord.Game("PZ: STOPPED"),
+                    status=discord.Status.idle,
+                )
             else:
-                # unknown
-                await client.change_presence(activity=discord.Game("PZ: ?"), status=discord.Status.dnd)
+                await client.change_presence(
+                    activity=discord.Game("PZ: ?"),
+                    status=discord.Status.dnd,
+                )
         except Exception:
-            # don’t spam logs here
             pass
+
         await asyncio.sleep(cfg.STATUS_REFRESH_SECONDS)
 
 
@@ -259,40 +274,36 @@ def log_action(i: discord.Interaction, action: str, exit_code: int, out: str):
 
 
 # ------------------ Commands ------------------
-@tree.command(name="pz_ping", description="Healthcheck du bot", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_ping", description="Bot healthcheck", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_ping(i: discord.Interaction):
     await i.response.send_message(embed=make_embed("PZ — Ping", "✅ Pong.", ok=True), ephemeral=True)
 
 
-@tree.command(name="pz_help", description="Liste des commandes + règles d’accès", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_help", description="Command list + access rules", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_help(i: discord.Interaction):
     desc = (
-        "**Commandes**\n"
-        "• `/pz_status` — affiche l’état du serveur\n"
-        "• `/pz_save` — save world (sensitif)\n"
-        "• `/pz_stop` — arrêt serveur (sensitif, confirmation)\n"
-        "• `/pz_start` — démarrer serveur (sensitif, confirmation)\n"
-        "• `/pz_restart` — restart serveur (sensitif, confirmation)\n"
-        "• `/pz_workshop_check` — vérifie updates workshop (via webhook)\n"
-        "• `/pz_grant @user` — donne le rôle PZ\n"
-        "• `/pz_revoke @user` — retire le rôle PZ\n"
-        "• `/pz_ping` — healthcheck bot\n\n"
-        "• /pz_players — liste les joueurs en ligne\n\n"
-        "**Accès**\n"
-        f"• Rôle requis: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
-        "• OU permission Discord `Administrator`\n"
-        "• OU (si activé) permissions de channel: `manage_guild` / `manage_channels` / `manage_messages`\n\n"
-        f"**Cooldown**: {cfg.COOLDOWN_SECONDS}s (commandes sensibles)\n"
+        "**Commands**\n"
+        "• `/pz_status` — server status + online player count\n"
+        "• `/pz_players` — list online players\n"
+        "• `/pz_save` — save world (sensitive)\n"
+        "• `/pz_stop` — stop server (sensitive, confirmation)\n"
+        "• `/pz_start` — start server (sensitive, confirmation)\n"
+        "• `/pz_restart` — restart server (sensitive, confirmation)\n"
+        "• `/pz_workshop_check` — check Workshop updates (webhook)\n"
+        "• `/pz_grant @user` — grant PZ role\n"
+        "• `/pz_revoke @user` — revoke PZ role\n"
+        "• `/pz_ping` — bot healthcheck\n\n"
+        "**Access**\n"
+        f"• Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
+        "• OR Discord permission: `Administrator`\n"
+        "• OR (if enabled) channel perms: `manage_guild` / `manage_channels` / `manage_messages`\n\n"
+        f"**Cooldown**: {cfg.COOLDOWN_SECONDS}s (sensitive commands)\n"
         f"**Confirmation**: {cfg.CONFIRM_SECONDS}s (stop/start/restart/grant/revoke)\n"
     )
     await i.response.send_message(embed=make_embed("PZ — Help", desc, ok=None), ephemeral=True)
 
 
-@tree.command(
-    name="pz_status",
-    description="Status du serveur Project Zomboid",
-    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
-)
+@tree.command(name="pz_status", description="Project Zomboid server status", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_status(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
 
@@ -300,68 +311,57 @@ async def pz_status(i: discord.Interaction):
     status, players = parse_status_with_players(out)
 
     ok = (code == 0) and (status in ("RUNNING", "STOPPED"))
-    desc = f"**Status:** `{status}`\n**Players en ligne:** `{players}`"
+    desc = f"**Status:** `{status}`\n**Online players:** `{players}`"
 
-    emb = make_embed("PZ — Status", desc, ok=ok)
     log_action(i, "status", code, out)
+    await i.followup.send(embed=make_embed("PZ — Status", desc, ok=ok), ephemeral=True)
 
-    await i.followup.send(embed=emb, ephemeral=True)
 
-@tree.command(
-    name="pz_players",
-    description="Liste les joueurs en ligne sur le serveur",
-    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
-)
+@tree.command(name="pz_players", description="List online players", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_players(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
 
     code, out = await run_control("players")
     t = (out or "").strip()
 
-    # cas serveur arrêté
     if "STOPPED" in t.upper():
-        emb = make_embed("PZ — Players", "🛑 Serveur arrêté.", ok=False)
         log_action(i, "players", code, out)
-        await i.followup.send(embed=emb, ephemeral=True)
+        await i.followup.send(embed=make_embed("PZ — Players", "🛑 Server is stopped.", ok=False), ephemeral=True)
         return
 
-    # cas none
     if t == "(none)" or t == "":
-        emb = make_embed("PZ — Players", "Aucun joueur en ligne.", ok=True)
         log_action(i, "players", code, out)
-        await i.followup.send(embed=emb, ephemeral=True)
+        await i.followup.send(embed=make_embed("PZ — Players", "No players online.", ok=True), ephemeral=True)
         return
 
-    # liste de noms (1 par ligne)
     names = [line.strip() for line in t.splitlines() if line.strip()]
     bullet_list = "\n".join([f"• `{n}`" for n in names])
 
-    desc = f"**{len(names)} joueur(s) en ligne :**\n{bullet_list}"
-    emb = make_embed("PZ — Players", desc, ok=True)
-
+    desc = f"**{len(names)} player(s) online:**\n{bullet_list}"
     log_action(i, "players", code, out)
-    await i.followup.send(embed=emb, ephemeral=True)
+    await i.followup.send(embed=make_embed("PZ — Players", desc, ok=True), ephemeral=True)
 
-@tree.command(name="pz_save", description="Save world maintenant (sensitif)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+
+@tree.command(name="pz_save", description="Save world now (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_save(i: discord.Interaction):
     if await require_admin(cfg, i) is None:
         return
     if not cooldown.check(i.user.id, "save"):
-        await i.response.send_message(embed=make_embed("Cooldown", "⏳ Attends un peu avant de refaire `/pz_save`.", ok=False), ephemeral=True)
+        await i.response.send_message(embed=make_embed("Cooldown", "⏳ Please wait before using `/pz_save` again.", ok=False), ephemeral=True)
         return
 
     await i.response.defer(ephemeral=True)
     code, out = await run_control("save")
-    ok = (code == 0) and ("OK" in out.upper() or "SAVED" in out.upper() or "STOPPED" in out.upper())
+    ok = (code == 0) and ("ERROR" not in out.upper())
     log_action(i, "save", code, out)
-    await i.followup.send(embed=make_embed("PZ — Save", f"**Résultat:** `{out}`", ok=ok), ephemeral=True)
+    await i.followup.send(embed=make_embed("PZ — Save", f"**Result:** `{out}`", ok=ok), ephemeral=True)
 
 
 async def _confirm_and_run(i: discord.Interaction, action: str, title: str):
     if await require_admin(cfg, i) is None:
         return
     if not cooldown.check(i.user.id, action):
-        await i.response.send_message(embed=make_embed("Cooldown", f"⏳ Attends un peu avant de refaire `{action}`.", ok=False), ephemeral=True)
+        await i.response.send_message(embed=make_embed("Cooldown", f"⏳ Please wait before using `{action}` again.", ok=False), ephemeral=True)
         return
 
     pending = PendingAction(action=action, created_at=time.time(), interaction_user_id=i.user.id)
@@ -371,50 +371,48 @@ async def _confirm_and_run(i: discord.Interaction, action: str, title: str):
         code, out = await run_control(action)
         ok = (code == 0) and ("ERROR" not in out.upper())
         log_action(i, action, code, out)
-        await inter2.followup.send(embed=make_embed(title, f"**Résultat:** `{out}`", ok=ok), ephemeral=True)
+        await inter2.followup.send(embed=make_embed(title, f"**Result:** `{out}`", ok=ok), ephemeral=True)
 
     view = ConfirmView(cfg, pending, on_confirm)
     await i.response.send_message(
-        embed=make_embed("Confirmation requise", f"Confirme l’action: **{action.upper()}**", ok=None),
+        embed=make_embed("Confirmation required", f"Confirm action: **{action.upper()}**", ok=None),
         view=view,
         ephemeral=True,
     )
 
 
-@tree.command(name="pz_stop", description="Stop serveur (sensitif)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_stop", description="Stop server (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_stop(i: discord.Interaction):
     await _confirm_and_run(i, "stop", "PZ — Stop")
 
 
-@tree.command(name="pz_start", description="Start serveur (sensitif)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_start", description="Start server (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_start(i: discord.Interaction):
     await _confirm_and_run(i, "start", "PZ — Start")
 
 
-@tree.command(name="pz_restart", description="Restart serveur (sensitif)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_restart", description="Restart server (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_restart(i: discord.Interaction):
     await _confirm_and_run(i, "restart", "PZ — Restart")
 
 
-@tree.command(name="pz_workshop_check", description="Vérifie updates Workshop (webhook)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_workshop_check", description="Check Workshop updates (webhook)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_workshop_check(i: discord.Interaction):
     if await require_admin(cfg, i) is None:
         return
     if not cooldown.check(i.user.id, "workshop_check"):
-        await i.response.send_message(embed=make_embed("Cooldown", "⏳ Attends un peu avant de relancer le check.", ok=False), ephemeral=True)
+        await i.response.send_message(embed=make_embed("Cooldown", "⏳ Please wait before running the check again.", ok=False), ephemeral=True)
         return
 
     await i.response.defer(ephemeral=True)
     code, out = await run_workshop_check()
-    # IMPORTANT: ce script PS envoie déjà les embeds dans Discord via webhook.
-    # Ici on renvoie juste un résumé propre.
     ok = (code == 0)
     log_action(i, "workshop_check", code, out)
-    await i.followup.send(embed=make_embed("Workshop Check", "✅ Check lancé via webhook." if ok else f"❌ Erreur: `{out}`", ok=ok), ephemeral=True)
+    await i.followup.send(embed=make_embed("Workshop Check", "✅ Check triggered via webhook." if ok else f"❌ Error: `{out}`", ok=ok), ephemeral=True)
 
 
-@tree.command(name="pz_grant", description="Donne le rôle PZ à un utilisateur", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-@app_commands.describe(user="Utilisateur à autoriser")
+@tree.command(name="pz_grant", description="Grant PZ role to a user", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(user="User to authorize")
 async def pz_grant(i: discord.Interaction, user: discord.Member):
     if await require_admin(cfg, i) is None:
         return
@@ -422,23 +420,23 @@ async def pz_grant(i: discord.Interaction, user: discord.Member):
     async def do_grant(inter2: discord.Interaction):
         role = inter2.guild.get_role(cfg.PZ_ADMIN_ROLE_ID) if inter2.guild else None
         if role is None:
-            await inter2.response.send_message(embed=make_embed("Grant", "❌ Rôle introuvable (ID incorrect?).", ok=False), ephemeral=True)
+            await inter2.response.send_message(embed=make_embed("Grant", "❌ Role not found (bad ID?).", ok=False), ephemeral=True)
             return
         await user.add_roles(role, reason=f"pz_grant by {user_tag(i)}")
         logger.info("grant role=%s(%s) target=%s(%s) by=%s", role.name, role.id, user.name, user.id, user_tag(i))
         audit_log(cfg, f"grant role={role.id} target={user.id} by={i.user.id}")
-        await inter2.response.send_message(embed=make_embed("Grant", f"✅ Rôle **{role.name}** donné à {user.mention}.", ok=True), ephemeral=True)
+        await inter2.response.send_message(embed=make_embed("Grant", f"✅ Granted **{role.name}** to {user.mention}.", ok=True), ephemeral=True)
 
     view = ConfirmView(cfg, PendingAction("grant", time.time(), i.user.id), do_grant)
     await i.response.send_message(
-        embed=make_embed("Confirmation requise", f"Donner le rôle PZ à {user.mention} ?", ok=None),
+        embed=make_embed("Confirmation required", f"Grant PZ role to {user.mention}?", ok=None),
         view=view,
         ephemeral=True,
     )
 
 
-@tree.command(name="pz_revoke", description="Retire le rôle PZ d’un utilisateur", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-@app_commands.describe(user="Utilisateur à retirer")
+@tree.command(name="pz_revoke", description="Revoke PZ role from a user", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(user="User to revoke")
 async def pz_revoke(i: discord.Interaction, user: discord.Member):
     if await require_admin(cfg, i) is None:
         return
@@ -446,16 +444,16 @@ async def pz_revoke(i: discord.Interaction, user: discord.Member):
     async def do_revoke(inter2: discord.Interaction):
         role = inter2.guild.get_role(cfg.PZ_ADMIN_ROLE_ID) if inter2.guild else None
         if role is None:
-            await inter2.response.send_message(embed=make_embed("Revoke", "❌ Rôle introuvable (ID incorrect?).", ok=False), ephemeral=True)
+            await inter2.response.send_message(embed=make_embed("Revoke", "❌ Role not found (bad ID?).", ok=False), ephemeral=True)
             return
         await user.remove_roles(role, reason=f"pz_revoke by {user_tag(i)}")
         logger.info("revoke role=%s(%s) target=%s(%s) by=%s", role.name, role.id, user.name, user.id, user_tag(i))
         audit_log(cfg, f"revoke role={role.id} target={user.id} by={i.user.id}")
-        await inter2.response.send_message(embed=make_embed("Revoke", f"✅ Rôle **{role.name}** retiré à {user.mention}.", ok=True), ephemeral=True)
+        await inter2.response.send_message(embed=make_embed("Revoke", f"✅ Revoked **{role.name}** from {user.mention}.", ok=True), ephemeral=True)
 
     view = ConfirmView(cfg, PendingAction("revoke", time.time(), i.user.id), do_revoke)
     await i.response.send_message(
-        embed=make_embed("Confirmation requise", f"Retirer le rôle PZ à {user.mention} ?", ok=None),
+        embed=make_embed("Confirmation required", f"Revoke PZ role from {user.mention}?", ok=None),
         view=view,
         ephemeral=True,
     )
@@ -475,7 +473,6 @@ async def on_ready():
     except Exception as e:
         logger.exception("Command sync failed: %s", e)
 
-    # presence loop
     client.loop.create_task(update_presence_loop())
 
 

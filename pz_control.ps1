@@ -9,8 +9,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ===== Paths =====
-$Base     = "C:\PZServerBuild42"
+# ===== Base / paths =====
+$Base = $env:PZ_BASE_DIR
+if ([string]::IsNullOrWhiteSpace($Base)) { $Base = "C:\PZServerBuild42" }
+
 $StartBat = Join-Path $Base "StartServer64.bat"
 $WorkDir  = $Base
 
@@ -46,6 +48,7 @@ function Get-UserHomeFromStartBat([string]$StartBatPath) {
     $p = $matches[1].Trim()
     if (-not [string]::IsNullOrWhiteSpace($p)) { return $p }
   }
+
   return $fallback
 }
 
@@ -69,17 +72,15 @@ function Get-RconConfig {
   [pscustomobject]@{ Port = $port; Pass = $pass }
 }
 
-# --- IMPORTANT FIX ---
-# In PowerShell, your "one-shot" mcrcon calls returned no output.
-# Workaround: launch mcrcon in interactive mode and write the command to stdin.
+# Interactive mcrcon (stdin) so output is reliably captured
 function Invoke-Mcrcon([string]$Command) {
   if (-not (Test-Path -LiteralPath $McrconExe)) {
-    throw "mcrcon.exe introuvable: $McrconExe (définis PZ_MCRCON_EXE ou place-le dans $Base\tools\mcrcon.exe)"
+    throw "mcrcon.exe not found: $McrconExe (set PZ_MCRCON_EXE or place it under $Base\tools\mcrcon.exe)"
   }
 
   $cfg = Get-RconConfig
   if ($null -eq $cfg) {
-    throw "RCONPort/RCONPassword introuvables dans $(Get-ServerIniPath)"
+    throw "RCONPort/RCONPassword not found in $(Get-ServerIniPath)"
   }
 
   $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -94,28 +95,21 @@ function Invoke-Mcrcon([string]$Command) {
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
 
-  if (-not $p.Start()) {
-    throw "Impossible de démarrer mcrcon.exe"
-  }
+  if (-not $p.Start()) { throw "Unable to start mcrcon.exe" }
 
-  # Send the command then exit to close the session
   $p.StandardInput.WriteLine($Command)
   $p.StandardInput.WriteLine("exit")
   $p.StandardInput.Flush()
   $p.StandardInput.Close()
 
-  # Read everything
   $stdout = $p.StandardOutput.ReadToEnd()
   $stderr = $p.StandardError.ReadToEnd()
   $p.WaitForExit(5000) | Out-Null
 
   $out = (($stdout + "`n" + $stderr) -replace "`r","").Trim()
-
-  # If mcrcon truly can't connect, it usually prints "Connection failed."
   if ($out -match '(?i)\bconnection failed\b') {
     throw "Connection failed (RCON host/port/pass?)"
   }
-
   return $out
 }
 
@@ -136,18 +130,15 @@ function Extract-PlayersFromOutput([string]$raw) {
   foreach ($l in $lines) {
     $s = $l.Trim()
 
-    # PZ format: "-arkuul" -> strip leading dash(es)
+    # PZ format: "-name"
     $s = $s -replace '^\-+\s*', ''
 
-    # Sometimes: "1. Name"
-    if ($s -match '^\s*\d+\s*[\.\)\-:]\s*(.+)$') {
-      $s = $matches[1].Trim()
-    }
+    # Strip list index "1. Name"
+    if ($s -match '^\s*\d+\s*[\.\)\-:]\s*(.+)$') { $s = $matches[1].Trim() }
 
     # Keep name before extra info
     $s = ($s -split '\s+\(|\s+\[|\s+-\s+|\s+steamid\s*[:=]\s*', 2)[0].Trim()
 
-    # Accept common chars (adjust if your usernames include spaces)
     if ($s -match '^[A-Za-z0-9_\-\.]{2,32}$') {
       $names.Add($s)
     }
@@ -159,10 +150,9 @@ function Extract-PlayersFromOutput([string]$raw) {
 function Get-PlayersViaRcon {
   $raw = Invoke-Mcrcon "players"
   $players = Extract-PlayersFromOutput $raw
-  @($players) # force array
+  @($players)
 }
 
-# ===== Actions =====
 switch ($Action) {
 
   "status" {
