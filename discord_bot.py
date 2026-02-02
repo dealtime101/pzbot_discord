@@ -1,6 +1,6 @@
 ﻿# discord_bot.py
 from __future__ import annotations
-
+import re
 import asyncio
 import logging
 import os
@@ -82,6 +82,20 @@ def make_embed(title: str, description: str, ok: bool | None = None) -> discord.
 def user_tag(i: discord.Interaction) -> str:
     u = i.user
     return f"{u.name}({u.id})"
+
+def parse_status_with_players(out: str) -> tuple[str, str]:
+    t = (out or "").strip()
+
+    status = "UNKNOWN"
+    up = t.upper()
+    if "RUNNING" in up:
+        status = "RUNNING"
+    elif "STOPPED" in up:
+        status = "STOPPED"
+
+    m = re.search(r"(?i)\bplayers\s*=\s*(\d+|\?)\b", t)
+    players = m.group(1) if m else "?"
+    return status, players
 
 
 # ------------------ Permission model ------------------
@@ -263,6 +277,7 @@ async def pz_help(i: discord.Interaction):
         "• `/pz_grant @user` — donne le rôle PZ\n"
         "• `/pz_revoke @user` — retire le rôle PZ\n"
         "• `/pz_ping` — healthcheck bot\n\n"
+        "• /pz_players — liste les joueurs en ligne\n\n"
         "**Accès**\n"
         f"• Rôle requis: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
         "• OU permission Discord `Administrator`\n"
@@ -273,15 +288,59 @@ async def pz_help(i: discord.Interaction):
     await i.response.send_message(embed=make_embed("PZ — Help", desc, ok=None), ephemeral=True)
 
 
-@tree.command(name="pz_status", description="Status du serveur Project Zomboid", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(
+    name="pz_status",
+    description="Status du serveur Project Zomboid",
+    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
+)
 async def pz_status(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
+
     code, out = await run_control("status")
-    ok = (code == 0) and ("RUNNING" in out.upper() or "STOPPED" in out.upper())
-    emb = make_embed("PZ — Status", f"**Résultat:** `{out}`", ok=ok)
+    status, players = parse_status_with_players(out)
+
+    ok = (code == 0) and (status in ("RUNNING", "STOPPED"))
+    desc = f"**Status:** `{status}`\n**Players en ligne:** `{players}`"
+
+    emb = make_embed("PZ — Status", desc, ok=ok)
     log_action(i, "status", code, out)
+
     await i.followup.send(embed=emb, ephemeral=True)
 
+@tree.command(
+    name="pz_players",
+    description="Liste les joueurs en ligne sur le serveur",
+    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
+)
+async def pz_players(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+
+    code, out = await run_control("players")
+    t = (out or "").strip()
+
+    # cas serveur arrêté
+    if "STOPPED" in t.upper():
+        emb = make_embed("PZ — Players", "🛑 Serveur arrêté.", ok=False)
+        log_action(i, "players", code, out)
+        await i.followup.send(embed=emb, ephemeral=True)
+        return
+
+    # cas none
+    if t == "(none)" or t == "":
+        emb = make_embed("PZ — Players", "Aucun joueur en ligne.", ok=True)
+        log_action(i, "players", code, out)
+        await i.followup.send(embed=emb, ephemeral=True)
+        return
+
+    # liste de noms (1 par ligne)
+    names = [line.strip() for line in t.splitlines() if line.strip()]
+    bullet_list = "\n".join([f"• `{n}`" for n in names])
+
+    desc = f"**{len(names)} joueur(s) en ligne :**\n{bullet_list}"
+    emb = make_embed("PZ — Players", desc, ok=True)
+
+    log_action(i, "players", code, out)
+    await i.followup.send(embed=emb, ephemeral=True)
 
 @tree.command(name="pz_save", description="Save world maintenant (sensitif)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_save(i: discord.Interaction):
