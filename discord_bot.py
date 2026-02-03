@@ -295,6 +295,7 @@ async def pz_help(i: discord.Interaction):
         "• `/pz_workshop_check` — check Workshop updates (webhook)\n"
         "• `/pz_grant @user` — grant PZ role\n"
         "• `/pz_revoke @user` — revoke PZ role\n"
+        "• `/pz_say <message>` — broadcast a message in-game\n"
         "• `/pz_ping` — bot healthcheck\n\n"
         "**Access**\n"
         f"• Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
