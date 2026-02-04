@@ -5,6 +5,8 @@ import re
 import asyncio
 import logging
 import os
+import json
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -235,6 +237,12 @@ async def run_control(action: str, extra_args: list[str] | None = None) -> tuple
         args.extend(extra_args)
     return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_CONTROL_PS1, args)
 
+async def run_logscan() -> tuple[int, str]:
+    return await run_powershell_script(
+        cfg.POWERSHELL_EXE,
+        cfg.PZ_LOGSCAN_PS1,
+        ["-LogPath", cfg.PZ_CONSOLE_LOG],
+    )
 
 async def run_workshop_check() -> tuple[int, str]:
     return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.WORKSHOP_CHECK_PS1, [])
@@ -267,6 +275,106 @@ async def update_presence_loop():
 
         await asyncio.sleep(cfg.STATUS_REFRESH_SECONDS)
 
+_last_alert_at = 0.0
+_seen_signatures: dict[str, float] = {}  # signature -> last_seen_ts
+_log_last_alert_at = 0.0
+_log_seen: dict[str, float] = {}  # signature -> last_seen_ts
+
+
+def _sig_from_line(line: str) -> str:
+    # Normalize noisy parts (timestamps / counters) to reduce duplicates
+    s = (line or "").strip()
+    s = re.sub(r"\[\d{2}-\d{2}-\d{2}.*?\]", "[ts]", s)            # [yy-mm-dd ...]
+    s = re.sub(r"\bt:\d+\b", "t:?", s)                            # t:17700...
+    s = re.sub(r"\bf:\d+\b", "f:?", s)                            # f:0
+    s = re.sub(r"\bst:[0-9,]+\b", "st:?", s)                      # st:380,483,474
+    s = s[:400]
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+async def monitor_console_loop():
+    global _last_alert_at, _seen_signatures
+
+    await client.wait_until_ready()
+
+    # Warm-up scan: establishes offset/buckets without posting alerts
+    try:
+        await run_logscan()
+        logger.info("logscan warm-up done (no alert).")
+    except Exception as e:
+        logger.exception("logscan warm-up failed: %s", e)
+
+    while not client.is_closed():
+        try:
+            code, out = await run_logscan()
+            if code != 0:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            data = json.loads(out)
+            crit = int(data.get("new_critical_count", 0))
+            if crit <= 0:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            now = time.time()
+            # Anti-spam: one alert per cooldown window
+            if (now - _last_alert_at) < cfg.LOGSCAN_ALERT_COOLDOWN_SECONDS:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            lines: list[str] = data.get("new_critical_lines", []) or []
+            if not lines:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            # Dedup within a time window
+            kept: list[str] = []
+            for line in lines:
+                sig = _sig_from_line(line)
+                last_seen = _seen_signatures.get(sig, 0.0)
+                if now - last_seen >= cfg.LOGSCAN_DEDUP_SECONDS:
+                    _seen_signatures[sig] = now
+                    kept.append(line)
+
+            # Cleanup old signatures (keep memory bounded)
+            cutoff = now - max(cfg.LOGSCAN_DEDUP_SECONDS * 2, 1800)
+            _seen_signatures = {k: v for k, v in _seen_signatures.items() if v >= cutoff}
+
+            if not kept:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            ch = client.get_channel(cfg.BUGS_CHANNEL_ID)
+            if ch is None:
+                ch = await client.fetch_channel(cfg.BUGS_CHANNEL_ID)
+
+            s1 = data.get("stats_1h", {})
+            s24 = data.get("stats_24h", {})
+            s30 = data.get("stats_30d", {})
+
+            preview = "\n".join(kept[:8])[:1800]
+
+            desc = (
+                f"**New critical events:** `{crit}` (dedup sent `{len(kept)}`)\n"
+                f"**New WARN:** `{data.get('new_warn', 0)}`  "
+                f"**ERROR:** `{data.get('new_error', 0)}`  "
+                f"**STACK:** `{data.get('new_stack', 0)}`\n\n"
+                f"```{preview}```\n"
+                f"**Last 1h** — WARN `{s1.get('warn',0)}`, ERROR `{s1.get('error',0)}`, STACK `{s1.get('stack',0)}`\n"
+                f"**Last 24h** — WARN `{s24.get('warn',0)}`, ERROR `{s24.get('error',0)}`, STACK `{s24.get('stack',0)}`\n"
+                f"**Last 30d** — WARN `{s30.get('warn',0)}`, ERROR `{s30.get('error',0)}`, STACK `{s30.get('stack',0)}`\n"
+                f"\n**Log:** `{data.get('log_path','')}`"
+            )
+
+            await ch.send(embed=make_embed("PZ — Console Alert", desc, ok=False))
+            _last_alert_at = now
+
+        except Exception as e:
+            logger.exception("monitor_console_loop error: %s", e)
+
+        await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+
 
 def log_action(i: discord.Interaction, action: str, exit_code: int, out: str):
     g = i.guild.id if i.guild else 0
@@ -275,6 +383,100 @@ def log_action(i: discord.Interaction, action: str, exit_code: int, out: str):
     logger.info(line)
     audit_log(cfg, line)
 
+def _log_sig(text: str) -> str:
+    s = (text or "").strip()
+    # normalize noise
+    s = re.sub(r"\[\d{2}-\d{2}-\d{2}.*?\]", "[ts]", s)
+    s = re.sub(r"\bt:\d+\b", "t:?", s)
+    s = re.sub(r"\bf:\d+\b", "f:?", s)
+    s = re.sub(r"\bst:[0-9,]+\b", "st:?", s)
+    s = s[:600]
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+async def monitor_console_loop():
+    global _log_last_alert_at, _log_seen
+    await client.wait_until_ready()
+
+    # warm-up: set offset without alerting
+    try:
+        await run_logscan()
+        logger.info("logscan warm-up done (no alert).")
+    except Exception as e:
+        logger.exception("logscan warm-up failed: %s", e)
+
+    while not client.is_closed():
+        try:
+            code, out = await run_logscan()
+            if code != 0:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            data = json.loads(out)
+
+            crit = int(data.get("new_critical_count", 0))
+            ignored = int(data.get("ignored_total", 0))
+            effective = max(0, crit - ignored)
+
+            if effective <= 0:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            now = time.time()
+            if (now - _log_last_alert_at) < cfg.LOGSCAN_ALERT_COOLDOWN_SECONDS:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            lines = data.get("new_critical_lines", []) or []
+            if not lines:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            # dedup
+            kept = []
+            for item in lines:
+                sig = _log_sig(item)
+                last = _log_seen.get(sig, 0.0)
+                if now - last >= cfg.LOGSCAN_DEDUP_SECONDS:
+                    _log_seen[sig] = now
+                    kept.append(item)
+
+            # cleanup dedup map
+            cutoff = now - max(cfg.LOGSCAN_DEDUP_SECONDS * 2, 1800)
+            _log_seen = {k: v for k, v in _log_seen.items() if v >= cutoff}
+
+            if not kept:
+                await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
+                continue
+
+            ch = client.get_channel(cfg.BUGS_CHANNEL_ID)
+            if ch is None:
+                ch = await client.fetch_channel(cfg.BUGS_CHANNEL_ID)
+
+            s1 = data.get("stats_1h", {})
+            s24 = data.get("stats_24h", {})
+            s30 = data.get("stats_30d", {})
+
+            preview = "\n\n".join(kept[:2])  # 2 blocks max
+            preview = preview[:1800]
+
+            desc = (
+                f"**New critical:** `{crit}`  | **Ignored:** `{ignored}`  | **Sent:** `{len(kept)}`\n"
+                f"**New WARN:** `{data.get('new_warn',0)}`  "
+                f"**New ERROR:** `{data.get('new_error',0)}`  "
+                f"**New STACK:** `{data.get('new_stack',0)}`\n\n"
+                f"```{preview}```\n"
+                f"**Last 1h** — WARN `{s1.get('warn',0)}`, ERROR `{s1.get('error',0)}`, STACK `{s1.get('stack',0)}`\n"
+                f"**Last 24h** — WARN `{s24.get('warn',0)}`, ERROR `{s24.get('error',0)}`, STACK `{s24.get('stack',0)}`\n"
+                f"**Last 30d** — WARN `{s30.get('warn',0)}`, ERROR `{s30.get('error',0)}`, STACK `{s30.get('stack',0)}`\n"
+            )
+
+            await ch.send(embed=make_embed("PZ — Console Alert", desc, ok=False))
+            _log_last_alert_at = now
+
+        except Exception as e:
+            logger.exception("monitor_console_loop error: %s", e)
+
+        await asyncio.sleep(cfg.LOGSCAN_INTERVAL_SECONDS)
 
 # ------------------ Commands ------------------
 @tree.command(name="pz_ping", description="Bot healthcheck", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
@@ -296,6 +498,7 @@ async def pz_help(i: discord.Interaction):
         "• `/pz_grant @user` — grant PZ role\n"
         "• `/pz_revoke @user` — revoke PZ role\n"
         "• `/pz_say <message>` — broadcast a message in-game\n"
+        "• `/pz_logstats` — Console log stats\n"
         "• `/pz_ping` — bot healthcheck\n\n"
         "**Access**\n"
         f"• Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
@@ -488,6 +691,30 @@ async def pz_say(i: discord.Interaction, message: str):
         ephemeral=True,
     )
 
+@tree.command(
+    name="pz_logstats",
+    description="Console log stats (WARN/ERROR/STACK) for 1h/24h/30d",
+    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
+)
+async def pz_logstats(i: discord.Interaction):
+    await i.response.defer(ephemeral=True)
+
+    code, out = await run_logscan()
+    if code != 0:
+        await i.followup.send(embed=make_embed("PZ — Log Stats", f"❌ `{out}`", ok=False), ephemeral=True)
+        return
+
+    data = json.loads(out)
+    s1 = data["stats_1h"]; s24 = data["stats_24h"]; s30 = data["stats_30d"]
+
+    desc = (
+        f"**Last 1h** — WARN `{s1['warn']}`, ERROR `{s1['error']}`, STACK `{s1['stack']}`\n"
+        f"**Last 24h** — WARN `{s24['warn']}`, ERROR `{s24['error']}`, STACK `{s24['stack']}`\n"
+        f"**Last 30d** — WARN `{s30['warn']}`, ERROR `{s30['error']}`, STACK `{s30['stack']}`\n"
+        f"\n**Log:** `{data.get('log_path','')}`"
+    )
+    await i.followup.send(embed=make_embed("PZ — Log Stats", desc, ok=True), ephemeral=True)
+
 
 # ------------------ Events ------------------
 @client.event
@@ -504,6 +731,7 @@ async def on_ready():
         logger.exception("Command sync failed: %s", e)
 
     client.loop.create_task(update_presence_loop())
+    client.loop.create_task(monitor_console_loop())
 
 
 # ------------------ Run ------------------

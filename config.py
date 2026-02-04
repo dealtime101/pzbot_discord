@@ -65,6 +65,12 @@ class Config:
     DISCORD_BOT_TOKEN: str
     DISCORD_GUILD_ID: int
     PZ_ADMIN_ROLE_ID: int
+    BUGS_CHANNEL_ID: int
+    PZ_LOGSCAN_PS1: str
+    PZ_CONSOLE_LOG: str
+    LOGSCAN_INTERVAL_SECONDS: int
+    LOGSCAN_ALERT_COOLDOWN_SECONDS: int
+    LOGSCAN_DEDUP_SECONDS: int
 
     # Paths
     POWERSHELL_EXE: str
@@ -91,9 +97,15 @@ def load_config() -> Config:
     log_dir = _env_str("PZ_LOG_DIR", r"C:\PZ_MaintenanceLogs")
 
     return Config(
+        BUGS_CHANNEL_ID=_env_int("DISCORD_BUGS_CHANNEL_ID", "1468051143614664838"),
+        PZ_LOGSCAN_PS1=os.environ.get("PZ_LOGSCAN_PS1", rf"{base}\pz_logscan.ps1"),
+        PZ_CONSOLE_LOG=os.environ.get("PZ_CONSOLE_LOG", rf"{base}\hh_saves\Zomboid\server-console.txt"),
+        LOGSCAN_INTERVAL_SECONDS=int(os.environ.get("PZ_LOGSCAN_INTERVAL_SECONDS", "25")),
         DISCORD_BOT_TOKEN=_env_required("DISCORD_BOT_TOKEN"),
         DISCORD_GUILD_ID=_env_int_required("DISCORD_GUILD_ID"),
         PZ_ADMIN_ROLE_ID=_env_int_required("PZ_ADMIN_ROLE_ID"),
+        LOGSCAN_ALERT_COOLDOWN_SECONDS=int(_env_str("PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS", "120")),
+        LOGSCAN_DEDUP_SECONDS=int(_env_str("PZ_LOGSCAN_DEDUP_SECONDS", "900")),
 
         POWERSHELL_EXE=_env_str(
             "POWERSHELL_EXE",
