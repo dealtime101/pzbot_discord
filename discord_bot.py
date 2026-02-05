@@ -14,7 +14,7 @@ from typing import Optional
 import discord
 from discord import app_commands
 
-from config import load_config, Config
+from config import load_config, Config, BOT_VERSION
 
 
 # ------------------ Logging ------------------
@@ -511,12 +511,16 @@ async def pz_help(i: discord.Interaction):
         "• `/pz_say <message>` — broadcast a message in-game\n"
         "• `/pz_logstats` — Console log stats\n"
         "• `/pz_ping` — bot healthcheck\n\n"
+     #  "• `/pz_logs recent` — Last ERROR / STACK TRACE"
+        "• `/pz_version` — Bot Version"
         "**Access**\n"
         f"• Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
         "• OR Discord permission: `Administrator`\n"
         "• OR (if enabled) channel perms: `manage_guild` / `manage_channels` / `manage_messages`\n\n"
         f"**Cooldown**: {cfg.COOLDOWN_SECONDS}s (sensitive commands)\n"
         f"**Confirmation**: {cfg.CONFIRM_SECONDS}s (stop/start/restart/grant/revoke)\n"
+        f"**Monitoring**\n"
+        "• Automatic Alerts ERROR / STACK TRACE → #bugs-reports"
     )
     await i.response.send_message(embed=make_embed("PZ — Help", desc, ok=None), ephemeral=True)
 
@@ -701,6 +705,19 @@ async def pz_say(i: discord.Interaction, message: str):
         embed=make_embed("PZ — Say", "✅ Message sent in-game." if ok else f"❌ Failed: `{out}`", ok=ok),
         ephemeral=True,
     )
+
+@tree.command(
+    name="pz_version",
+    description="Show the current bot version",
+    guild=discord.Object(id=cfg.DISCORD_GUILD_ID),
+)
+async def pz_version(i: discord.Interaction):
+    desc = (
+        f"**PZ Discord Bot**\n"
+        f"Version: `v{BOT_VERSION}`\n"
+    )
+    emb = make_embed("ℹ️ PZ — Version", desc, ok=True)
+    await i.response.send_message(embed=emb, ephemeral=True)
 
 @tree.command(
     name="pz_logstats",

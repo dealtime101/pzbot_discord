@@ -1,10 +1,12 @@
+# Bot version (SemVer)
+BOT_VERSION = "1.3.2"
+
 # config.py
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
-
 
 def _getenv_raw(name: str, default: str | None = None) -> str | None:
     v = os.environ.get(name, default)
