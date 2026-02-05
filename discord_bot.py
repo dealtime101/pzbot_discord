@@ -84,6 +84,13 @@ def make_embed(title: str, description: str, ok: bool | None = None) -> discord.
     emb.timestamp = discord.utils.utcnow()
     return emb
 
+def severity_style(warn: int, error: int, stack: int) -> tuple[int, str]:
+    if error > 0 or stack > 0:
+        return 0xe74c3c, "🚨"   # red
+    if warn > 0:
+        return 0xf39c12, "⚠️"   # orange
+    return 0x2ecc71, "✅"       # green
+
 
 def user_tag(i: discord.Interaction) -> str:
     u = i.user
@@ -464,10 +471,14 @@ async def monitor_console_loop():
                 f"**New WARN:** `{data.get('new_warn',0)}`  "
                 f"**New ERROR:** `{data.get('new_error',0)}`  "
                 f"**New STACK:** `{data.get('new_stack',0)}`\n\n"
+                f"**Ignored WARN:** `{data.get('ignored_warn',0)}`  "
+                f"**Ignored ERROR:** `{data.get('ignored_error',0)}`  "
+                f"**Ignored STACK:** `{data.get('ignored_stack',0)}`\n"
                 f"```{preview}```\n"
                 f"**Last 1h** — WARN `{s1.get('warn',0)}`, ERROR `{s1.get('error',0)}`, STACK `{s1.get('stack',0)}`\n"
                 f"**Last 24h** — WARN `{s24.get('warn',0)}`, ERROR `{s24.get('error',0)}`, STACK `{s24.get('stack',0)}`\n"
                 f"**Last 30d** — WARN `{s30.get('warn',0)}`, ERROR `{s30.get('error',0)}`, STACK `{s30.get('stack',0)}`\n"
+                f"**Log:** `{data.get('log_path','')}`\n"
             )
 
             await ch.send(embed=make_embed("PZ — Console Alert", desc, ok=False))
@@ -713,7 +724,20 @@ async def pz_logstats(i: discord.Interaction):
         f"**Last 30d** — WARN `{s30['warn']}`, ERROR `{s30['error']}`, STACK `{s30['stack']}`\n"
         f"\n**Log:** `{data.get('log_path','')}`"
     )
-    await i.followup.send(embed=make_embed("PZ — Log Stats", desc, ok=True), ephemeral=True)
+    warn = stats1h.get("warn", 0)
+    error = stats1h.get("error", 0)
+    stack = stats1h.get("stack", 0)
+
+    color, emoji = severity_style(warn, error, stack)
+
+    emb = discord.Embed(
+        title=f"{emoji} PZ — Log Stats",
+        description=desc,
+        color=color,
+    )
+    emb.timestamp = discord.utils.utcnow()
+
+    await i.followup.send(embed=emb, ephemeral=True)
 
 
 # ------------------ Events ------------------
