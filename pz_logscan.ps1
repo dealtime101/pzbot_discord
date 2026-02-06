@@ -21,9 +21,7 @@ function ConvertTo-HashtableRecursive($obj) {
 
   if ($obj -is [System.Collections.IDictionary]) {
     $ht = @{}
-    foreach ($k in $obj.Keys) {
-      $ht[$k] = ConvertTo-HashtableRecursive $obj[$k]
-    }
+    foreach ($k in $obj.Keys) { $ht[$k] = ConvertTo-HashtableRecursive $obj[$k] }
     return $ht
   }
 
@@ -35,9 +33,7 @@ function ConvertTo-HashtableRecursive($obj) {
 
   if ($obj -is [pscustomobject]) {
     $ht = @{}
-    foreach ($p in $obj.PSObject.Properties) {
-      $ht[$p.Name] = ConvertTo-HashtableRecursive $p.Value
-    }
+    foreach ($p in $obj.PSObject.Properties) { $ht[$p.Name] = ConvertTo-HashtableRecursive $p.Value }
     return $ht
   }
 
@@ -50,9 +46,7 @@ function Load-Json([string]$p, $fallback) {
       $raw = Get-Content -LiteralPath $p -Raw -Encoding UTF8
       if ([string]::IsNullOrWhiteSpace($raw)) { return $fallback }
       return (ConvertTo-HashtableRecursive ($raw | ConvertFrom-Json))
-    } catch {
-      return $fallback
-    }
+    } catch { return $fallback }
   }
   return $fallback
 }
@@ -61,7 +55,7 @@ function Save-Json([string]$p, $obj) {
   $obj | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $p -Encoding UTF8
 }
 
-# Defaults "friendly user"
+# Defaults (friendly user)
 $LogPath  = Resolve-PathOrDefault $LogPath  "PZ_CONSOLE_LOG" (Join-Path $env:USERPROFILE "Zomboid\server-console.txt")
 $StateDir = Resolve-PathOrDefault $StateDir "PZ_LOGSCAN_STATE_DIR" "C:\PZ_MaintenanceLogs\PZLogScan"
 $IgnoreRegex = Resolve-PathOrDefault $IgnoreRegex "PZ_LOGSCAN_IGNORE_REGEX" ""
@@ -78,43 +72,30 @@ if (-not [string]::IsNullOrWhiteSpace($IgnoreRegex)) {
 function Is-IgnoredText([string]$text) {
   if ($ignorePatterns.Count -eq 0) { return $false }
   foreach ($pat in $ignorePatterns) {
-    try {
-      if ($text -match $pat) { return $true }
-    } catch {
-      # Invalid regex -> ignore it (don’t break scanning)
-      continue
-    }
+    try { if ($text -match $pat) { return $true } }
+    catch { continue } # invalid regex -> ignore it (don't break scanning)
   }
   return $false
 }
 
-if (-not (Test-Path -LiteralPath $LogPath)) {
-  throw "LogPath not found: $LogPath"
-}
-if (-not (Test-Path -LiteralPath $StateDir)) {
-  New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
-}
+if (-not (Test-Path -LiteralPath $LogPath)) { throw "LogPath not found: $LogPath" }
+if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
 
 $stateFile  = Join-Path $StateDir "state.json"
 $bucketFile = Join-Path $StateDir "buckets.json"
 
-# state: last byte offset
 $state = Load-Json $stateFile @{ offset = 0 }
 if ($null -eq $state) { $state = @{ offset = 0 } }
 if (-not $state.ContainsKey("offset")) { $state["offset"] = 0 }
 
-# buckets: hashtable of hashtables
-# { "yyyyMMddHH": { warn:int, error:int, stack:int } }
 $buckets = Load-Json $bucketFile @{}
 if ($null -eq $buckets) { $buckets = @{} }
 
 # Handle truncation (log rotated/cleared)
 $fi = Get-Item -LiteralPath $LogPath
-if ($fi.Length -lt [int64]$state["offset"]) {
-  $state["offset"] = 0
-}
+if ($fi.Length -lt [int64]$state["offset"]) { $state["offset"] = 0 }
 
-# Read new bytes since last offset (efficient)
+# Read new bytes since last offset
 $fs = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
 $newLines = New-Object System.Collections.Generic.List[string]
 try {
@@ -128,11 +109,9 @@ try {
 
   $state["offset"] = $fs.Position
 }
-finally {
-  $fs.Dispose()
-}
+finally { $fs.Dispose() }
 
-# Regex to parse PZ console timestamp like: [25-01-26 12:32:55.070]
+# Parse timestamp like: [25-01-26 12:32:55.070]
 $tsRe = [regex]'^\[(\d{2})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]'
 
 function Parse-Timestamp([string]$line) {
@@ -145,6 +124,7 @@ function Parse-Timestamp([string]$line) {
   $HH = [int]$m.Groups[4].Value
   $mm = [int]$m.Groups[5].Value
   $ss = [int]$m.Groups[6].Value
+
   $fff = 0
   if ($m.Groups[7].Success) {
     $fffStr = $m.Groups[7].Value
@@ -164,7 +144,6 @@ function EnsureBucket([string]$k) {
   if (-not $buckets.ContainsKey($k)) {
     $buckets[$k] = @{ warn = 0; error = 0; stack = 0 }
   } else {
-    # normalize in case JSON brought something weird
     if (-not ($buckets[$k] -is [System.Collections.IDictionary])) {
       $buckets[$k] = ConvertTo-HashtableRecursive $buckets[$k]
     }
@@ -185,26 +164,21 @@ $newCounts = @{ warn = 0; error = 0; stack = 0 }
 $ignoredCounts = @{ warn = 0; error = 0; stack = 0 }
 $now = Get-Date
 
-# helper: detect a new log entry (timestamped) like [25-01-26 12:32:55.070]
 function Is-NewEntryLine([string]$line) {
   return ($tsRe.IsMatch($line))
 }
 
-# iterate with index so we can "consume" following lines for stack traces
 for ($i = 0; $i -lt $newLines.Count; $i++) {
   $line = $newLines[$i]
   $upper = $line.ToUpperInvariant()
 
   $isWarn = ($upper -match '\bWARN\b')
-  $isStackStart = ($upper -match 'STACK TRACE') -or ($upper -match 'STACKTRACE')
-
-  # If stack starts on a line that also contains ERROR, avoid double "error + stack" preview.
+  $isStackStart = ($upper -match 'STACK TRACE') -or ($upper -match 'STACKTRACE') # matches "Stack trace:" too after ToUpper
   $isError = (-not $isStackStart) -and ($upper -match '\bERROR\b')
 
-  # If none, continue early
   if (-not ($isWarn -or $isError -or $isStackStart)) { continue }
 
-  # Ignore for line-based WARN/ERROR (stack handled as block below)
+  # Ignore line-based WARN/ERROR
   if (($isWarn -or $isError) -and (Is-IgnoredText $line)) {
     if ($isWarn)  { $ignoredCounts["warn"]++ }
     if ($isError) { $ignoredCounts["error"]++ }
@@ -223,29 +197,26 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
   if ($isError) {
     IncBucket $hk "error" 1
     $newCounts["error"]++
-
-    # add single-line error to critical preview (bounded)
-    if ($newCritical.Count -lt $MaxCriticalLines) {
-      $newCritical.Add($line)
-    }
+    if ($newCritical.Count -lt $MaxCriticalLines) { $newCritical.Add($line) }
   }
 
   if ($isStackStart) {
-    # Capture stack block (with context)
     $block = New-Object System.Collections.Generic.List[string]
 
-    # Include up to 2 previous lines as context (if they exist and are not new timestamp entries)
-    for ($b = 2; $b -ge 1; $b--) {
+    # include previous lines as context (even if timestamped)
+    $prevTake = 3
+    for ($b = $prevTake; $b -ge 1; $b--) {
       $pi = $i - $b
       if ($pi -ge 0) {
         $prev = $newLines[$pi]
-        if (-not (Is-NewEntryLine $prev)) { $block.Add($prev) }
+        if (-not [string]::IsNullOrWhiteSpace($prev)) { $block.Add($prev) }
       }
     }
 
     $block.Add($line)
 
-    $maxFollow = 20
+    # follow lines (more than 20 to be more useful)
+    $maxFollow = 40
     for ($j = 1; $j -le $maxFollow; $j++) {
       $k = $i + $j
       if ($k -ge $newLines.Count) { break }
@@ -254,74 +225,21 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
       $block.Add($next)
     }
 
-    # Move index forward to skip consumed lines
+    # move forward
     $i = $i + ($block.Count - 1)
 
     $blockText = ($block -join "`n")
 
-    # Ignore stack blocks if any ignore pattern matches the block text
     if (Is-IgnoredText $blockText) {
       $ignoredCounts["stack"]++
       continue
     }
 
-    # Count one stack trace per block (only if not ignored)
     IncBucket $hk "stack" 1
     $newCounts["stack"]++
-
-    # Add multi-line block to critical preview (bounded)
-    if ($newCritical.Count -lt $MaxCriticalLines) {
-      $newCritical.Add($blockText)
-    }
+    if ($newCritical.Count -lt $MaxCriticalLines) { $newCritical.Add($blockText) }
   }
 }
-
-
-if ($isStackStart) {
-  # Capture stack block (with context)
-  $block = New-Object System.Collections.Generic.List[string]
-
-  # Include up to 2 previous lines as context (if they exist and are not new timestamp entries)
-  for ($b = 2; $b -ge 1; $b--) {
-    $pi = $i - $b
-    if ($pi -ge 0) {
-      $prev = $newLines[$pi]
-      if (-not (Is-NewEntryLine $prev)) { $block.Add($prev) }
-    }
-  }
-
-  $block.Add($line)
-
-  $maxFollow = 20
-  for ($j = 1; $j -le $maxFollow; $j++) {
-    $k = $i + $j
-    if ($k -ge $newLines.Count) { break }
-    $next = $newLines[$k]
-    if (Is-NewEntryLine $next) { break }
-    $block.Add($next)
-  }
-
-  # Move index forward to skip consumed lines
-  $i = $i + ($block.Count - 1)
-
-  $blockText = ($block -join "`n")
-
-  # Ignore?
-  if (Is-IgnoredText $blockText) {
-    $ignoredCounts["stack"]++
-    continue
-  }
-
-  # Count one stack trace per block
-  IncBucket $hk "stack" 1
-  $newCounts["stack"]++
-
-  # Add multi-line block to critical preview (bounded)
-  if ($newCritical.Count -lt $MaxCriticalLines) {
-    $newCritical.Add($blockText)
-  }
-}
-
 
 # cleanup old buckets > 35 days
 $cutoff = (Get-Date).AddDays(-35)
@@ -352,11 +270,9 @@ $stats1h  = Sum-Window ([timespan]::FromHours(1))
 $stats24h = Sum-Window ([timespan]::FromHours(24))
 $stats30d = Sum-Window ([timespan]::FromDays(30))
 
-# persist
 Save-Json $stateFile  $state
 Save-Json $bucketFile $buckets
 
-# output machine-friendly JSON
 $out = @{
   log_path = $LogPath
   scanned_new_lines = $newLines.Count
