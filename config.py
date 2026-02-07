@@ -5,6 +5,9 @@ import os
 import re
 from dataclasses import dataclass
 
+# Bot version (SemVer)
+BOT_VERSION = "1.3.4"
+
 
 def _env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name, default)
@@ -14,7 +17,7 @@ def _env(name: str, default: str | None = None) -> str:
 
 
 def _env_int_flexible(name: str, default: str | None = None) -> int:
-    """Accepts plain integers or mention-like values: <123>, <@123>, <@&123>."""
+    """Accept plain integers or mention-like values: <123>, <@123>, <@&123>."""
     raw = _env(name, default)
     digits = re.sub(r"\D+", "", raw)
     if digits == "":
@@ -28,20 +31,16 @@ class Config:
     DISCORD_BOT_TOKEN: str
     DISCORD_GUILD_ID: int
     PZ_ADMIN_ROLE_ID: int
-
-    # Optional mention (string like "<@&123>" or "@here" or "")
-    DISCORD_PING_ON_UPDATE: str
-
-    # Channel to post critical console alerts (bugs/crashes)
     DISCORD_BUGS_CHANNEL_ID: int
+
+    # Optional mention string (e.g. "<@&123>" or "@here" or "")
+    DISCORD_PING_ON_UPDATE: str
 
     # Paths
     POWERSHELL_EXE: str
     PZ_CONTROL_PS1: str
-    WORKSHOP_CHECK_PS1: str  # webhook script
-    PZ_LOGSCAN_PS1: str      # console scanner
-
-    # Console log path
+    WORKSHOP_CHECK_PS1: str
+    PZ_LOGSCAN_PS1: str
     PZ_CONSOLE_LOG: str
 
     # Behaviour
@@ -51,10 +50,17 @@ class Config:
     STATUS_REFRESH_SECONDS: int
     PZ_LOGSCAN_INTERVAL_SECONDS: int
 
+    # Dedup / alert pacing
+    PZ_LOG_DEDUP_SECONDS: int
+    PZ_ALERT_MIN_INTERVAL_SECONDS: int
+
     # Logging
     LOG_DIR: str
     BOT_LOG_FILE: str
     ACTION_AUDIT_LOG: str
+
+    # Nickname
+    DISCORD_BOT_NICKNAME: str
 
 
 def load_config() -> Config:
@@ -65,18 +71,16 @@ def load_config() -> Config:
         DISCORD_BOT_TOKEN=_env("DISCORD_BOT_TOKEN"),
         DISCORD_GUILD_ID=_env_int_flexible("DISCORD_GUILD_ID"),
         PZ_ADMIN_ROLE_ID=_env_int_flexible("PZ_ADMIN_ROLE_ID"),
-
-        DISCORD_PING_ON_UPDATE=os.environ.get("DISCORD_PING_ON_UPDATE", "").strip(),
         DISCORD_BUGS_CHANNEL_ID=_env_int_flexible("DISCORD_BUGS_CHANNEL_ID", "0"),
+        DISCORD_PING_ON_UPDATE=os.environ.get("DISCORD_PING_ON_UPDATE", "").strip(),
 
         POWERSHELL_EXE=os.environ.get(
             "POWERSHELL_EXE",
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         ),
         PZ_CONTROL_PS1=os.environ.get("PZ_CONTROL_PS1", rf"{base}\pz_control.ps1"),
-        WORKSHOP_CHECK_PS1=os.environ.get("WORKSHOP_CHECK_PS1", rf"{base}\Maintain-PZServerUpdateNotifTask.ps1"),
+        WORKSHOP_CHECK_PS1=os.environ.get("WORKSHOP_CHECK_PS1", rf"{base}\pzbot_workshop_check.ps1"),
         PZ_LOGSCAN_PS1=os.environ.get("PZ_LOGSCAN_PS1", rf"{base}\pz_logscan.ps1"),
-
         PZ_CONSOLE_LOG=os.environ.get(
             "PZ_CONSOLE_LOG",
             os.path.join(os.environ.get("USERPROFILE", r"C:\Users\Public"), "Zomboid", "server-console.txt"),
@@ -88,7 +92,12 @@ def load_config() -> Config:
         STATUS_REFRESH_SECONDS=int(os.environ.get("PZ_STATUS_REFRESH_SECONDS", "30")),
         PZ_LOGSCAN_INTERVAL_SECONDS=int(os.environ.get("PZ_LOGSCAN_INTERVAL_SECONDS", "25")),
 
+        PZ_LOG_DEDUP_SECONDS=int(os.environ.get("PZ_LOG_DEDUP_SECONDS", "600")),  # 10 min
+        PZ_ALERT_MIN_INTERVAL_SECONDS=int(os.environ.get("PZ_ALERT_MIN_INTERVAL_SECONDS", "15")),
+
         LOG_DIR=log_dir,
         BOT_LOG_FILE=os.path.join(log_dir, "pz_discord_bot.log"),
         ACTION_AUDIT_LOG=os.path.join(log_dir, "pz_discord_actions.log"),
+
+        DISCORD_BOT_NICKNAME=os.environ.get("DISCORD_BOT_NICKNAME", "PZBot").strip() or "PZBot",
     )
