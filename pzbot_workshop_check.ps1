@@ -1,4 +1,4 @@
-﻿# Maintain-PZServerUpdateNotifTask.ps1 (FINAL - PS 5.1 compatible)
+﻿# pzbot_workshop_check.ps1 (PS 5.1 compatible)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -16,14 +16,23 @@ $LockPath = Join-Path $LogDir "workshop-check.lock"
 $StateDir = "C:\PZServerBuild42\state"
 $StatePath = Join-Path $StateDir "workshop-webhook-state.json"
 
+# Webhook display identity (prevents "servertest" / server name from showing)
+$WebhookUsername = [string]$env:DISCORD_WEBHOOK_USERNAME
+if ($null -eq $WebhookUsername -or [string]::IsNullOrWhiteSpace($WebhookUsername)) { $WebhookUsername = "PZBot" }
+$WebhookUsername = $WebhookUsername.Trim()
+
 # Optional: role mention string like "<@&ROLE_ID>" or "@here" or ""
 $DiscordPingOnUpdate = [string]$env:DISCORD_PING_ON_UPDATE
 if ($null -eq $DiscordPingOnUpdate) { $DiscordPingOnUpdate = "" }
 $DiscordPingOnUpdate = $DiscordPingOnUpdate.Trim()
 
-# Optional: if you want to restrict allowed_mentions to a specific role id, set it here.
-# If empty, we'll fall back to parse roles/everyone as before.
-$PingRoleId = "1465913550730952726"  # your @PZ role id
+# Optional: Restrict allowed_mentions to a specific role id (safer).
+# You can also provide it via env: DISCORD_PING_ROLE_ID
+$PingRoleId = [string]$env:DISCORD_PING_ROLE_ID
+if ($null -eq $PingRoleId -or [string]::IsNullOrWhiteSpace($PingRoleId)) {
+  $PingRoleId = "1465913550730952726"  # default fallback
+}
+$PingRoleId = ($PingRoleId -replace "\D","").Trim()
 
 
 # ====== HELPERS ======
@@ -45,15 +54,9 @@ function Write-Log([string]$Message) {
 
 function Get-WebhookParts([string]$Url) {
   $Url = ($Url -replace "[`r`n`t ]", "").Trim()
-
   if ($Url -notmatch "/webhooks/(\d+)/([^/?]+)") { throw "Invalid webhook url format." }
-
-  return @{
-    id    = $matches[1]
-    token = $matches[2].Trim()
-  }
+  return @{ id = $matches[1]; token = $matches[2].Trim() }
 }
-
 
 function Read-State {
   Write-Log ("STATE PATH: {0}" -f $StatePath)
@@ -67,17 +70,15 @@ function Read-State {
     $rawText = Get-Content -LiteralPath $StatePath -Raw
     Write-Log ("STATE RAW: {0}" -f ($rawText -replace "`r?`n"," "))
 
-    # PS 5.1 safe: ConvertFrom-Json returns a PSCustomObject (no -AsHashtable)
     $obj = $rawText | ConvertFrom-Json
 
     $check = $null
     $details = $null
 
-    # Read as properties (new format)
     if ($obj.PSObject.Properties.Name -contains "check")   { $check = [string]$obj.check }
     if ($obj.PSObject.Properties.Name -contains "details") { $details = [string]$obj.details }
 
-    # Backward compatibility (old format if you ever had it)
+    # Backward compatibility
     if (-not $check -and ($obj.PSObject.Properties.Name -contains "check_message_id")) {
       $check = [string]$obj.check_message_id
     }
@@ -97,7 +98,6 @@ function Read-State {
   }
 }
 
-
 function Write-State($state) {
   $out = @{ check = $state.check; details = $state.details }
   $json = $out | ConvertTo-Json -Depth 6
@@ -107,15 +107,12 @@ function Write-State($state) {
 }
 
 function Invoke-DiscordDeleteMessage([string]$WebhookUrl, [string]$MessageId) {
-  if ([string]::IsNullOrWhiteSpace($MessageId)) {
-    #Write-Log "DELETE SKIP: empty message id"
-    return
-  }
+  if ([string]::IsNullOrWhiteSpace($MessageId)) { return }
+
   $WebhookUrl = ($WebhookUrl -replace "[`r`n]", "").Trim()
   $parts = Get-WebhookParts $WebhookUrl
   $deleteUrl = "https://discord.com/api/webhooks/$($parts.id)/$($parts.token)/messages/$MessageId"
 
-  # safe log (no token)
   $safeDeleteUrl = "https://discord.com/api/webhooks/$($parts.id)/***/messages/$MessageId"
   Write-Log "DELETE TRY: $safeDeleteUrl"
 
@@ -125,7 +122,6 @@ function Invoke-DiscordDeleteMessage([string]$WebhookUrl, [string]$MessageId) {
   } catch {
     $code = $null
     $body = $null
-
     try { $code = [int]$_.Exception.Response.StatusCode } catch {}
     try {
       $stream = $_.Exception.Response.GetResponseStream()
@@ -154,6 +150,13 @@ function Invoke-DiscordPostEmbed([string]$WebhookUrl, $payloadObj) {
     throw ("Invalid webhook URL: '{0}'" -f $WebhookUrl)
   }
 
+  # force webhook username (prevents "server name" / "servertest" look)
+  if (-not ($payloadObj.ContainsKey("username"))) {
+    $payloadObj["username"] = $WebhookUsername
+  } else {
+    $payloadObj["username"] = $WebhookUsername
+  }
+
   $json = $payloadObj | ConvertTo-Json -Depth 10
   $postUrl = [Uri]::new($WebhookUrl + "?wait=true")
 
@@ -172,7 +175,6 @@ function Invoke-DiscordPostEmbed([string]$WebhookUrl, $payloadObj) {
     throw
   }
 }
-
 
 function Get-WorkshopIdsFromIni([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) { throw "INI not found: $Path" }
@@ -227,15 +229,9 @@ function New-Embed($title, $desc, $ok) {
 }
 
 function New-AllowedMentionsForPingRole {
-  # Restrict mentions strictly to PingRoleId (safer)
   if (-not [string]::IsNullOrWhiteSpace($PingRoleId)) {
-    return @{
-      parse = @()
-      roles = @($PingRoleId)
-    }
+    return @{ parse = @(); roles = @($PingRoleId) }
   }
-
-  # Fallback (less safe)
   return @{ parse = @("roles","everyone") }
 }
 
@@ -247,12 +243,9 @@ Write-Log ("PID={0} User={1}" -f $PID, [Environment]::UserName)
 
 $url = [string]$env:DISCORD_WEBHOOK_URL
 if ($null -eq $url) { $url = "" }
-
-# remove invisible whitespace/newlines + trim
 $url = ($url -replace "[`r`n`t ]", "").Trim()
 
 Write-Log ("WEBHOOK URL (sanitized) startswith=https? {0}" -f ($url.StartsWith("https://")))
-
 Write-Log ("ENV(DISCORD_WEBHOOK_URL)='{0}'" -f ($url -replace '[\r\n]',''))
 
 # Validation URL (fail fast)
@@ -262,8 +255,6 @@ try {
 } catch {
   throw ("Invalid DISCORD_WEBHOOK_URL value: '{0}'" -f ($url -replace '[\r\n]',''))
 }
-if ($null -eq $url) { $url = "" }
-$url = $url.Trim()
 
 if ([string]::IsNullOrWhiteSpace($url)) {
   Write-Log "FATAL: DISCORD_WEBHOOK_URL missing."
@@ -296,7 +287,7 @@ try {
 
     $idCheck = Invoke-DiscordPostEmbed $url @{
       content = ""
-      embeds = @( New-Embed "PZ Workshop Check" "Aucun WorkshopItems trouvé dans l’INI." $null )
+      embeds = @( New-Embed "PZ Workshop Check" "No WorkshopItems found in the INI." $null )
       allowed_mentions = (New-AllowedMentionsForPingRole)
     }
 
@@ -369,19 +360,19 @@ try {
 
   $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
 
-  $checkDesc = "Date: **$ts**`nIDs surveillés: **$($ids.Count)**`n"
+  $checkDesc = "Date: **$ts**`nWatched IDs: **$($ids.Count)**`n"
   if ($updates.Count -gt 0) {
     $checkDesc += "`n🚨 **UPDATE AVAILABLE:** $($updates.Count)`n"
     $maxLines = 15
     $i = 0
     foreach ($u in $updates) {
-      if ($i -ge $maxLines) { $checkDesc += "`n… (+$($updates.Count-$maxLines) autres)"; break }
+      if ($i -ge $maxLines) { $checkDesc += "`n… (+$($updates.Count-$maxLines) more)"; break }
       $t = if ($u.Title) { $u.Title } else { "(no title)" }
       $checkDesc += "• **$($u.WorkshopId)** — $t`n"
       $i++
     }
   } else {
-    $checkDesc += "`n✅ Aucun update détecté."
+    $checkDesc += "`n✅ No updates detected."
   }
 
   # Content ping (only when updates)
@@ -422,7 +413,6 @@ try {
     }
   }
 
-  # Normalize nulls
   if ([string]::IsNullOrWhiteSpace([string]$idDetails)) { $idDetails = $null }
 
   $state.check = $idCheck
@@ -436,7 +426,6 @@ catch {
   $msg = $_.Exception.Message
   Write-Log "FATAL: $msg"
 
-  # Post a fatal embed (replace previous)
   $state = Read-State
   Invoke-DiscordDeleteMessage $url $state.check
   Invoke-DiscordDeleteMessage $url $state.details
