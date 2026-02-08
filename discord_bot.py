@@ -231,17 +231,11 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 
-# ------------------ Bot bootstrap ------------------
+# ------------------ Config / Files ------------------
 cfg = load_config()
 logger = setup_logging(cfg)
 cooldown = Cooldown(cfg.COOLDOWN_SECONDS)
 
-intents = discord.Intents.default()
-intents.members = True  # needed for role checks & nickname
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-# Files (no env vars)
 IGNORE_FILE = Path(cfg.LOG_DIR) / "pz_ignore_regex.txt"
 DEDUP_FILE = Path(cfg.LOG_DIR) / "pz_bug_dedup.json"
 
@@ -305,7 +299,7 @@ def save_dedup_state(state: dict[str, float]) -> None:
         pass
 
 
-# ------------------ Control runners ------------------
+# ------------------ Runners ------------------
 async def run_control(action: str) -> tuple[int, str]:
     return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_CONTROL_PS1, ["-Action", action])
 
@@ -315,12 +309,13 @@ async def run_workshop_check() -> tuple[int, str]:
 
 
 async def run_logscan() -> tuple[int, str]:
+    # pz_logscan.ps1 must support: -LogPath, -IgnoreFile
     args = ["-LogPath", cfg.PZ_CONSOLE_LOG, "-IgnoreFile", str(IGNORE_FILE)]
     return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_LOGSCAN_PS1, args)
 
 
-# ------------------ Presence loop ------------------
-async def update_presence_loop():
+# ------------------ Background loops ------------------
+async def update_presence_loop(client: discord.Client):
     await client.wait_until_ready()
     while not client.is_closed():
         try:
@@ -348,8 +343,7 @@ async def update_presence_loop():
         await asyncio.sleep(cfg.STATUS_REFRESH_SECONDS)
 
 
-# ------------------ Bug report alert loop (NO mentions) ------------------
-async def bug_alert_loop():
+async def bug_alert_loop(client: discord.Client):
     await client.wait_until_ready()
 
     if cfg.DISCORD_BUGS_CHANNEL_ID <= 0:
@@ -364,7 +358,7 @@ async def bug_alert_loop():
         logger.exception("Logscan warm-up failed: %s", e)
 
     dedup = load_dedup_state()
-    ttl_seconds = 10 * 60  # 10 minutes
+    ttl_seconds = int(cfg.PZ_LOGSCAN_DEDUP_SECONDS)
 
     while not client.is_closed():
         try:
@@ -411,7 +405,7 @@ async def bug_alert_loop():
                 excerpt_short = excerpt[:1200]
                 desc += f"\n```text\n{excerpt_short}\n```"
 
-            # stats blocks
+            # stats blocks (optional if your pz_logscan outputs them)
             s24 = data.get("stats_24h", {}) or {}
             s3d = data.get("stats_3d", {}) or {}
             s7d = data.get("stats_7d", {}) or {}
@@ -438,16 +432,34 @@ async def bug_alert_loop():
         await asyncio.sleep(cfg.PZ_LOGSCAN_INTERVAL_SECONDS)
 
 
-def log_action(i: discord.Interaction, action: str, exit_code: int, out: str):
-    g = i.guild.id if i.guild else 0
-    ch = i.channel.id if i.channel else 0
-    line = f"action={action} user={user_tag(i)} guild={g} channel={ch} exit={exit_code} out={out.replace(chr(10),'\\n')[:200]}"
-    logger.info(line)
-    audit_log(cfg, line)
+# ------------------ Bot class ------------------
+class PZBotClient(discord.Client):
+    def __init__(self, *, intents: discord.Intents):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self) -> None:
+        # Start background tasks here (discord.py safe)
+        asyncio.create_task(update_presence_loop(self))
+        asyncio.create_task(bug_alert_loop(self))
+
+        # Sync commands (guild scoped)
+        try:
+            await self.tree.sync(guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+            logger.info("Slash commands synced.")
+        except Exception as e:
+            logger.exception("Slash sync failed: %s", e)
+
+
+# ------------------ Client init ------------------
+intents = discord.Intents.default()
+intents.members = True
+client = PZBotClient(intents=intents)
+tree = client.tree
 
 
 # ------------------ Commands ------------------
-@tree.command(name="pz_help", description="Show PZBot commands")
+@tree.command(name="pz_help", description="Show PZBot commands", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_help(i: discord.Interaction):
     desc = (
         "**Core**\n"
@@ -469,7 +481,7 @@ async def pz_help(i: discord.Interaction):
     await i.response.send_message(embed=make_embed("PZ — Help", desc, SEV_BLUE), ephemeral=True)
 
 
-@tree.command(name="pz_version", description="Show bot version")
+@tree.command(name="pz_version", description="Show bot version", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_version(i: discord.Interaction):
     await i.response.send_message(
         embed=make_embed("PZ — Version", f"**PZBot:** `{cfg.BOT_VERSION}`", SEV_BLUE),
@@ -477,45 +489,42 @@ async def pz_version(i: discord.Interaction):
     )
 
 
-@tree.command(name="pz_status", description="Show server status")
+@tree.command(name="pz_status", description="Show server status", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_status(i: discord.Interaction):
     code, out = await run_control("status")
     status, players = parse_status_with_players(out)
-    ok = status == "RUNNING"
-    color = SEV_GREEN if ok else SEV_ORANGE if status == "STOPPED" else SEV_RED
+    color = SEV_GREEN if status == "RUNNING" else SEV_ORANGE if status == "STOPPED" else SEV_RED
     desc = f"**Status:** `{status}`\n**Players:** `{players}`"
     await i.response.send_message(embed=make_embed("PZ — Status", desc, color), ephemeral=True)
 
 
-@tree.command(name="pz_players", description="Show online players")
+@tree.command(name="pz_players", description="Show online players", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_players(i: discord.Interaction):
     code, out = await run_control("players")
     color = SEV_BLUE if code == 0 else SEV_RED
     await i.response.send_message(embed=make_embed("PZ — Players", f"```{out}```", color), ephemeral=True)
 
 
-@tree.command(name="pz_workshop_check", description="Run workshop check now")
+@tree.command(name="pz_workshop_check", description="Run workshop check now", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_workshop_check(i: discord.Interaction):
     m = await require_admin(cfg, i)
     if m is None:
         return
     code, out = await run_workshop_check()
     color = SEV_GREEN if code == 0 else SEV_RED
-    log_action(i, "workshop_check", code, out)
     await i.response.send_message(embed=make_embed("PZ — Workshop Check", f"```{out}```", color), ephemeral=True)
 
 
-@tree.command(name="pz_start", description="Start the PZ server (admin)")
+@tree.command(name="pz_start", description="Start the PZ server (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_start(i: discord.Interaction):
     m = await require_admin(cfg, i)
     if m is None:
         return
     code, out = await run_control("start")
-    log_action(i, "start", code, out)
     await i.response.send_message(embed=make_embed("PZ — Start", f"```{out}```", SEV_BLUE), ephemeral=True)
 
 
-@tree.command(name="pz_stop", description="Stop the PZ server (admin)")
+@tree.command(name="pz_stop", description="Stop the PZ server (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_stop(i: discord.Interaction):
     m = await require_admin(cfg, i)
     if m is None:
@@ -525,7 +534,6 @@ async def pz_stop(i: discord.Interaction):
 
     async def do_confirm(interaction: discord.Interaction):
         code, out = await run_control("stop")
-        log_action(i, "stop", code, out)
         await interaction.response.edit_message(embed=make_embed("PZ — Stop", f"```{out}```", SEV_BLUE), view=None)
 
     await i.response.send_message(
@@ -535,7 +543,7 @@ async def pz_stop(i: discord.Interaction):
     )
 
 
-@tree.command(name="pz_restart", description="Restart the PZ server (admin)")
+@tree.command(name="pz_restart", description="Restart the PZ server (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_restart(i: discord.Interaction):
     m = await require_admin(cfg, i)
     if m is None:
@@ -545,7 +553,6 @@ async def pz_restart(i: discord.Interaction):
 
     async def do_confirm(interaction: discord.Interaction):
         code, out = await run_control("restart")
-        log_action(i, "restart", code, out)
         await interaction.response.edit_message(embed=make_embed("PZ — Restart", f"```{out}```", SEV_BLUE), view=None)
 
     await i.response.send_message(
@@ -555,7 +562,7 @@ async def pz_restart(i: discord.Interaction):
     )
 
 
-@tree.command(name="pz_ignore_list", description="List ignore regex patterns")
+@tree.command(name="pz_ignore_list", description="List ignore regex patterns", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_ignore_list(i: discord.Interaction):
     pats = load_ignore_patterns()
     if not pats:
@@ -567,7 +574,7 @@ async def pz_ignore_list(i: discord.Interaction):
     await i.response.send_message(embed=make_embed("PZ — Ignore List", body, SEV_BLUE), ephemeral=True)
 
 
-@tree.command(name="pz_ignore_add", description="Add a regex to ignore list")
+@tree.command(name="pz_ignore_add", description="Add a regex to ignore list", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 @app_commands.describe(regex="Regex pattern to ignore")
 async def pz_ignore_add(i: discord.Interaction, regex: str):
     m = await require_admin(cfg, i)
@@ -593,7 +600,7 @@ async def pz_ignore_add(i: discord.Interaction, regex: str):
     await i.response.send_message(embed=make_embed("PZ — Ignore", f"Added: `{regex}`", SEV_GREEN), ephemeral=True)
 
 
-@tree.command(name="pz_ignore_remove", description="Remove a regex from ignore list")
+@tree.command(name="pz_ignore_remove", description="Remove a regex from ignore list", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 @app_commands.describe(regex="Regex pattern to remove")
 async def pz_ignore_remove(i: discord.Interaction, regex: str):
     m = await require_admin(cfg, i)
@@ -611,92 +618,6 @@ async def pz_ignore_remove(i: discord.Interaction, regex: str):
     await i.response.send_message(embed=make_embed("PZ — Ignore", f"Removed: `{regex}`", SEV_GREEN), ephemeral=True)
 
 
-@tree.command(name="pz_logstats", description="Show log stats (1h/24h/3d/7d/30d)")
-async def pz_logstats(i: discord.Interaction):
-    code, out = await run_logscan()
-    if code != 0:
-        await i.response.send_message(embed=make_embed("PZ — Log Stats", f"```{out}```", SEV_RED), ephemeral=True)
-        return
-
-    data = json.loads(out)
-    s1 = data.get("stats_1h", {}) or {}
-    s24 = data.get("stats_24h", {}) or {}
-    s3d = data.get("stats_3d", {}) or {}
-    s7d = data.get("stats_7d", {}) or {}
-    s30 = data.get("stats_30d", {}) or {}
-
-    warn = int(s1.get("warn", 0) or 0)
-    err = int(s1.get("error", 0) or 0)
-    stack = int(s1.get("stack", 0) or 0)
-
-    color, emoji = severity_style(warn, err, stack)
-
-    desc = (
-        f"**Last 1h** — WARN `{warn}`, ERROR `{err}`, STACK `{stack}`\n"
-        f"**Last 24h** — WARN `{s24.get('warn',0)}`, ERROR `{s24.get('error',0)}`, STACK `{s24.get('stack',0)}`\n"
-        f"**Last 3d** — WARN `{s3d.get('warn',0)}`, ERROR `{s3d.get('error',0)}`, STACK `{s3d.get('stack',0)}`\n"
-        f"**Last 7d** — WARN `{s7d.get('warn',0)}`, ERROR `{s7d.get('error',0)}`, STACK `{s7d.get('stack',0)}`\n"
-        f"**Last 30d** — WARN `{s30.get('warn',0)}`, ERROR `{s30.get('error',0)}`, STACK `{s30.get('stack',0)}`\n\n"
-        f"**Log:** `{data.get('log_path','')}`"
-    )
-
-    emb = discord.Embed(title=f"{emoji} PZ — Log Stats", description=desc, color=color)
-    emb.timestamp = discord.utils.utcnow()
-    await i.response.send_message(embed=emb, ephemeral=True)
-
-
-@tree.command(name="pz_logs_recent", description="Show recent critical excerpts from the last scan")
-async def pz_logs_recent(i: discord.Interaction):
-    code, out = await run_logscan()
-    if code != 0:
-        await i.response.send_message(embed=make_embed("PZ — Logs Recent", f"```{out}```", SEV_RED), ephemeral=True)
-        return
-
-    data = json.loads(out)
-    recent = data.get("recent_critical", []) or []
-    if not recent:
-        await i.response.send_message(embed=make_embed("PZ — Logs Recent", "(none)", SEV_GREEN), ephemeral=True)
-        return
-
-    lines = []
-    for ev in recent[-8:]:
-        sig = str(ev.get("signature", "")).strip()
-        excerpt = str(ev.get("excerpt", "")).strip().replace("\n", " ")
-        excerpt = excerpt[:180]
-        if sig:
-            lines.append(f"• `{sig}` — {excerpt}")
-        else:
-            lines.append(f"• {excerpt}")
-
-    await i.response.send_message(embed=make_embed("PZ — Logs Recent", "\n".join(lines), SEV_BLUE), ephemeral=True)
-
-
-@tree.command(name="pz_logs_top", description="Show top signatures (24h)")
-async def pz_logs_top(i: discord.Interaction):
-    code, out = await run_logscan()
-    if code != 0:
-        await i.response.send_message(embed=make_embed("PZ — Logs Top", f"```{out}```", SEV_RED), ephemeral=True)
-        return
-
-    data = json.loads(out)
-    top = data.get("top_signatures_24h", []) or []
-    if not top:
-        await i.response.send_message(embed=make_embed("PZ — Logs Top", "(none)", SEV_GREEN), ephemeral=True)
-        return
-
-    rows = []
-    for item in top[:10]:
-        sig = str(item.get("signature", "")).strip()
-        count = int(item.get("count", 0) or 0)
-        label = str(item.get("label", "")).strip()
-        if label:
-            rows.append(f"• **{label}** × `{count}`")
-        else:
-            rows.append(f"• `{sig}` × `{count}`")
-
-    await i.response.send_message(embed=make_embed("PZ — Logs Top (24h)", "\n".join(rows), SEV_BLUE), ephemeral=True)
-
-
 # ------------------ Events ------------------
 @client.event
 async def on_ready():
@@ -711,19 +632,6 @@ async def on_ready():
     except Exception:
         pass
 
-    try:
-        await tree.sync(guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-        logger.info("Slash commands synced.")
-    except Exception as e:
-        logger.exception("Slash sync failed: %s", e)
 
-
-# ------------------ Main ------------------
-async def main():
-    client.loop.create_task(update_presence_loop())
-    client.loop.create_task(bug_alert_loop())
-    await client.start(cfg.DISCORD_BOT_TOKEN)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# ------------------ Run ------------------
+client.run(cfg.DISCORD_BOT_TOKEN)
