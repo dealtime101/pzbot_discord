@@ -1,8 +1,8 @@
-﻿# pz_control.ps1
-[CmdletBinding()]
+﻿# pz_control.ps1 (PS 5.1)
+# Actions: status | players | save | start | stop | restart | say
 param(
   [Parameter(Mandatory=$true)]
-  [ValidateSet("save","stop","start","restart","status","players","say")]
+  [ValidateSet("status","players","save","start","stop","restart","say")]
   [string]$Action,
 
   [string]$Message = ""
@@ -10,258 +10,149 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
-# ===== Base / paths =====
-$Base = $env:PZ_BASE_DIR
-if ([string]::IsNullOrWhiteSpace($Base)) { $Base = "C:\PZServerBuild42" }
-
-$StartBat = Join-Path $Base "StartServer64.bat"
-$WorkDir  = $Base
-
-# ===== mcrcon =====
-$McrconExe = $env:PZ_MCRCON_EXE
-if ([string]::IsNullOrWhiteSpace($McrconExe)) {
-  $McrconExe = Join-Path $Base "tools\mcrcon.exe"
+function EnvOr([string]$name, [string]$fallback) {
+  $v = [Environment]::GetEnvironmentVariable($name, "Process")
+  if ([string]::IsNullOrWhiteSpace($v)) { $v = [Environment]::GetEnvironmentVariable($name, "Machine") }
+  if ([string]::IsNullOrWhiteSpace($v)) { return $fallback }
+  return $v.Trim()
 }
 
-$RconHost = $env:PZ_RCON_HOST
-if ([string]::IsNullOrWhiteSpace($RconHost)) { $RconHost = "127.0.0.1" }
+$ServerRoot = EnvOr "PZ_SERVER_ROOT" "C:\PZServerBuild42"
+$StartBat   = EnvOr "PZ_START_BAT"   (Join-Path $ServerRoot "StartServer64.bat")
 
-function Write-Out([string]$s) {
-  if ([string]::IsNullOrWhiteSpace($s)) { $s = "(no output)" }
-  Write-Output $s
-}
+$RconHost = EnvOr "PZ_RCON_HOST" "127.0.0.1"
+$RconPort = [int](EnvOr "PZ_RCON_PORT" "27015")
+$RconPass = EnvOr "PZ_RCON_PASSWORD" ""
 
-function Get-PZServerProcess {
-  Get-CimInstance Win32_Process |
-    Where-Object {
-      $_.Name -match '^java(\.exe)?$' -and
-      $_.CommandLine -match 'zombie\.network\.GameServer'
-    }
-}
+$McrconExe = EnvOr "PZ_MCRCON_EXE" (Join-Path $ServerRoot "mcrcon.exe")
 
-function Get-UserHomeFromStartBat([string]$StartBatPath) {
-  $fallback = Join-Path $Base "hh_saves"
-  if (-not (Test-Path -LiteralPath $StartBatPath)) { return $fallback }
-
-  try { $txt = Get-Content -LiteralPath $StartBatPath -Raw -ErrorAction Stop } catch { return $fallback }
-
-  if ($txt -match '-Duser\.home\s*=\s*"([^"]+)"') {
-    $p = $matches[1].Trim()
-    if (-not [string]::IsNullOrWhiteSpace($p)) { return $p }
+function Get-PZProcess {
+  $procs = Get-CimInstance Win32_Process -Filter "Name='java.exe' OR Name='javaw.exe'" -ErrorAction SilentlyContinue
+  foreach ($p in $procs) {
+    try {
+      if ($p.CommandLine -and ($p.CommandLine -match "zombie\.network\.GameServer")) { return $p }
+    } catch {}
   }
-
-  return $fallback
+  return $null
 }
 
-function Get-ServerIniPath {
-  $userHome = Get-UserHomeFromStartBat $StartBat
-  Join-Path $userHome "Zomboid\Server\servertest.ini"
-}
-
-function Get-RconConfig {
-  $ini = Get-ServerIniPath
-  if (-not (Test-Path -LiteralPath $ini)) { return $null }
-
-  $port = $null
-  $pass = $null
-  foreach ($line in (Get-Content -LiteralPath $ini -ErrorAction Stop)) {
-    if ($line -match '^\s*RCONPort\s*=\s*(\d+)\s*$')      { $port = [int]$matches[1]; continue }
-    if ($line -match '^\s*RCONPassword\s*=\s*(.+?)\s*$') { $pass = $matches[1].Trim(); continue }
+function Invoke-Rcon([string]$cmd) {
+  if ([string]::IsNullOrWhiteSpace($RconPass)) {
+    throw "PZ_RCON_PASSWORD is missing (cannot run rcon command: $cmd)"
   }
-
-  if ($null -eq $port -or [string]::IsNullOrWhiteSpace($pass)) { return $null }
-  [pscustomobject]@{ Port = $port; Pass = $pass }
-}
-
-# Interactive mcrcon (stdin) so output is reliably captured
-function Invoke-Mcrcon([string]$Command) {
   if (-not (Test-Path -LiteralPath $McrconExe)) {
-    throw "mcrcon.exe not found: $McrconExe (set PZ_MCRCON_EXE or place it under $Base\tools\mcrcon.exe)"
+    throw "mcrcon.exe not found at: $McrconExe (set PZ_MCRCON_EXE)"
   }
 
-  $cfg = Get-RconConfig
-  if ($null -eq $cfg) {
-    throw "RCONPort/RCONPassword not found in $(Get-ServerIniPath)"
-  }
+  $args = @(
+    "-H", $RconHost,
+    "-P", "$RconPort",
+    "-p", $RconPass,
+    $cmd
+  )
 
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $McrconExe
-  $psi.Arguments = "-H $RconHost -P $($cfg.Port) -p `"$($cfg.Pass)`""
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardInput  = $true
+  $psi.Arguments = ($args -join " ")
   $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError  = $true
+  $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
 
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
-
-  if (-not $p.Start()) { throw "Unable to start mcrcon.exe" }
-
-  $p.StandardInput.WriteLine($Command)
-  $p.StandardInput.WriteLine("exit")
-  $p.StandardInput.Flush()
-  $p.StandardInput.Close()
-
+  [void]$p.Start()
   $stdout = $p.StandardOutput.ReadToEnd()
   $stderr = $p.StandardError.ReadToEnd()
-  $p.WaitForExit(5000) | Out-Null
+  $p.WaitForExit()
 
-  $out = (($stdout + "`n" + $stderr) -replace "`r","").Trim()
-  if ($out -match '(?i)\bconnection failed\b') {
-    throw "Connection failed (RCON host/port/pass?)"
-  }
-  return $out
+  return ($stdout + "`n" + $stderr).Trim()
 }
 
-function Extract-PlayersFromOutput([string]$raw) {
-  if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
-
-  $lines = $raw -split "`n" |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -ne "" }
-
-  # Remove headers/noise
-  $lines = $lines | Where-Object {
-    $_ -notmatch '^(?i)(players connected|connected players|players online|online players|usage|help|authenticated|connecting|mcrcon|>)\b'
+function Status-Text {
+  $proc = Get-PZProcess
+  if ($null -eq $proc) {
+    return "STOPPED players=?"
   }
 
-  $names = New-Object System.Collections.Generic.List[string]
-
-  foreach ($l in $lines) {
-    $s = $l.Trim()
-
-    # PZ format: "-name"
-    $s = $s -replace '^\-+\s*', ''
-
-    # Strip list index "1. Name"
-    if ($s -match '^\s*\d+\s*[\.\)\-:]\s*(.+)$') { $s = $matches[1].Trim() }
-
-    # Keep name before extra info
-    $s = ($s -split '\s+\(|\s+\[|\s+-\s+|\s+steamid\s*[:=]\s*', 2)[0].Trim()
-
-    if ($s -match '^[A-Za-z0-9_\-\.]{2,32}$') {
-      $names.Add($s)
+  $players = "?"
+  try {
+    $resp = Invoke-Rcon "players"
+    if ($resp) {
+      $names = @($resp -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      $players = "$($names.Count)"
     }
-  }
+  } catch { }
 
-  @($names.ToArray() | Sort-Object -Unique)
+  return "RUNNING players=$players"
 }
 
-function Get-PlayersViaRcon {
-  $raw = Invoke-Mcrcon "players"
-  $players = Extract-PlayersFromOutput $raw
-  @($players)
+function Players-Text {
+  $proc = Get-PZProcess
+  if ($null -eq $proc) { return "STOPPED" }
+
+  try {
+    $resp = Invoke-Rcon "players"
+    $names = @($resp -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($names.Count -eq 0) { return "(none)" }
+    return ($names -join "`n")
+  } catch {
+    return "(none)"
+  }
+}
+
+function Start-Server {
+  if (-not (Test-Path -LiteralPath $StartBat)) {
+    throw "Start script not found: $StartBat (set PZ_START_BAT)"
+  }
+  $proc = Get-PZProcess
+  if ($proc) { return "Already running" }
+
+  Start-Process -FilePath $StartBat -WorkingDirectory (Split-Path -Parent $StartBat) | Out-Null
+  Start-Sleep -Seconds 2
+  return "Start initiated"
+}
+
+function Stop-Server {
+  $proc = Get-PZProcess
+  if (-not $proc) { return "Already stopped" }
+
+  try { [void](Invoke-Rcon "quit") } catch {}
+  Start-Sleep -Seconds 2
+
+  $proc = Get-PZProcess
+  if ($proc) {
+    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  return "Stop initiated"
+}
+
+function Save-World {
+  $proc = Get-PZProcess
+  if (-not $proc) { return "STOPPED" }
+
+  try { [void](Invoke-Rcon "save") } catch {}
+  return "Save triggered"
+}
+
+function Say-Server([string]$msg) {
+  $proc = Get-PZProcess
+  if (-not $proc) { return "STOPPED" }
+  if ([string]::IsNullOrWhiteSpace($msg)) { return "Message empty" }
+
+  $safe = $msg.Replace('"','\"')
+  try { [void](Invoke-Rcon "servermsg ""$safe""") } catch {}
+  return "Message sent"
 }
 
 switch ($Action) {
-
-  "status" {
-    $proc = Get-PZServerProcess
-    if ($null -eq $proc) { Write-Out "STOPPED | players=0"; exit 0 }
-
-    try {
-      $players = @(Get-PlayersViaRcon)
-      Write-Out ("RUNNING | players={0}" -f $players.Count)
-    } catch {
-      Write-Out "RUNNING | players=?"
-    }
-    exit 0
-  }
-
-  "players" {
-    $proc = Get-PZServerProcess
-    if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
-
-    try {
-      $players = @(Get-PlayersViaRcon)
-      if ($players.Count -eq 0) { Write-Out "(none)"; exit 0 }
-      $players | ForEach-Object { Write-Output $_ }
-      exit 0
-    } catch {
-      Write-Out ("ERROR: " + $_.Exception.Message)
-      exit 2
-    }
-  }
-
-  "start" {
-    if (-not (Test-Path -LiteralPath $StartBat)) {
-      Write-Out "ERROR: StartServer64.bat not found: $StartBat"
-      exit 2
-    }
-
-    $proc = Get-PZServerProcess
-    if ($null -ne $proc) { Write-Out "RUNNING"; exit 0 }
-
-    Start-Process -FilePath $StartBat -WorkingDirectory $WorkDir | Out-Null
-    Start-Sleep -Seconds 2
-
-    $proc2 = Get-PZServerProcess
-    if ($null -ne $proc2) { Write-Out "LAUNCHED"; exit 0 }
-
-    Write-Out "LAUNCH_FAILED"
-    exit 2
-  }
-
-  "stop" {
-    $proc = Get-PZServerProcess
-    if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
-
-    foreach ($p in $proc) {
-      try { Stop-Process -Id $p.ProcessId -ErrorAction SilentlyContinue } catch {}
-    }
-
-    Start-Sleep -Seconds 3
-    $proc2 = Get-PZServerProcess
-    if ($null -eq $proc2) { Write-Out "STOPPED"; exit 0 }
-
-    foreach ($p in $proc2) {
-      try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-    }
-
-    Start-Sleep -Seconds 1
-    $proc3 = Get-PZServerProcess
-    if ($null -eq $proc3) { Write-Out "STOPPED"; exit 0 }
-
-    Write-Out "STOP_FAILED"
-    exit 2
-  }
-
-  "restart" {
-    & $PSCommandPath -Action stop | Out-Null
-    Start-Sleep -Seconds 1
-    & $PSCommandPath -Action start
-    exit $LASTEXITCODE
-  }
-
-  "save" {
-    $proc = Get-PZServerProcess
-    if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
-    Write-Out "OK"
-    exit 0
-  }
-  "say" {
-    $proc = Get-PZServerProcess
-    if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
-
-    if ([string]::IsNullOrWhiteSpace($Message)) {
-      Write-Out "ERROR: Message is required"
-      exit 2
-    }
-
-    # Escape quotes for safety
-    $msg = $Message.Replace('"','\"')
-
-    try {
-      # Project Zomboid supports 'servermsg' in many setups.
-      # If your server uses a different command, we can adjust.
-      $raw = Invoke-Mcrcon "servermsg `"$msg`""
-      Write-Out "OK"
-      exit 0
-    } catch {
-      Write-Out ("ERROR: " + $_.Exception.Message)
-      exit 2
-    }
-  }
+  "status"  { Status-Text; exit 0 }
+  "players" { Players-Text; exit 0 }
+  "save"    { Save-World; exit 0 }
+  "start"   { Start-Server; exit 0 }
+  "stop"    { Stop-Server; exit 0 }
+  "restart" { [void](Stop-Server); Start-Sleep -Seconds 2; Start-Server; exit 0 }
+  "say"     { Say-Server $Message; exit 0 }
 }
