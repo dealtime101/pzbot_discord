@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 # Bot version (SemVer)
-BOT_VERSION = "1.3.4"
+BOT_VERSION = "1.3.5.1"
 
 
 def _env(name: str, default: str | None = None) -> str:
