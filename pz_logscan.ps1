@@ -2,7 +2,8 @@ param(
   [string]$LogPath = "",
   [string]$StateDir = "",
   [int]$MaxCriticalLines = 8,
-  [string]$IgnoreRegex = ""
+  [string]$IgnoreRegex = "",
+  [string]$IgnoreFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,13 +56,34 @@ function Save-Json([string]$p, $obj) {
   $obj | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $p -Encoding UTF8
 }
 
-# Defaults (friendly user)
+# Defaults "friendly user"
 $LogPath  = Resolve-PathOrDefault $LogPath  "PZ_CONSOLE_LOG" (Join-Path $env:USERPROFILE "Zomboid\server-console.txt")
 $StateDir = Resolve-PathOrDefault $StateDir "PZ_LOGSCAN_STATE_DIR" "C:\PZ_MaintenanceLogs\PZLogScan"
 $IgnoreRegex = Resolve-PathOrDefault $IgnoreRegex "PZ_LOGSCAN_IGNORE_REGEX" ""
+$IgnoreFile = Resolve-PathOrDefault $IgnoreFile "PZ_LOGSCAN_IGNORE_FILE" (Join-Path $StateDir "ignore_regex.txt")
 
-# Ignore patterns: multiple regex separated by ';'
+if (-not (Test-Path -LiteralPath $LogPath)) { throw "LogPath not found: $LogPath" }
+if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+
+# Ignore patterns: (file + param)
 $ignorePatterns = @()
+
+# From file: 1 regex per line (ignore empty + comments)
+if (-not [string]::IsNullOrWhiteSpace($IgnoreFile) -and (Test-Path -LiteralPath $IgnoreFile)) {
+  try {
+    $lines = Get-Content -LiteralPath $IgnoreFile -Encoding UTF8
+    foreach ($ln in $lines) {
+      $t = ($ln + "").Trim()
+      if (-not $t) { continue }
+      if ($t.StartsWith("#")) { continue }
+      $ignorePatterns += $t
+    }
+  } catch {
+    # don't break scanning
+  }
+}
+
+# From param: multiple regex separated by ';'
 if (-not [string]::IsNullOrWhiteSpace($IgnoreRegex)) {
   foreach ($p in ($IgnoreRegex -split ';')) {
     $pp = $p.Trim()
@@ -72,59 +94,57 @@ if (-not [string]::IsNullOrWhiteSpace($IgnoreRegex)) {
 function Is-IgnoredText([string]$text) {
   if ($ignorePatterns.Count -eq 0) { return $false }
   foreach ($pat in $ignorePatterns) {
-    try { if ($text -match $pat) { return $true } }
-    catch { continue } # invalid regex -> ignore it (don't break scanning)
+    try {
+      if ($text -match $pat) { return $true }
+    } catch {
+      continue
+    }
   }
   return $false
 }
 
-if (-not (Test-Path -LiteralPath $LogPath)) { throw "LogPath not found: $LogPath" }
-if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
-
 $stateFile  = Join-Path $StateDir "state.json"
 $bucketFile = Join-Path $StateDir "buckets.json"
 
+# state: last byte offset
 $state = Load-Json $stateFile @{ offset = 0 }
 if ($null -eq $state) { $state = @{ offset = 0 } }
 if (-not $state.ContainsKey("offset")) { $state["offset"] = 0 }
 
+# buckets: { "yyyyMMddHH": { warn:int, error:int, stack:int } }
 $buckets = Load-Json $bucketFile @{}
 if ($null -eq $buckets) { $buckets = @{} }
 
-# Handle truncation (log rotated/cleared)
+# Handle truncation
 $fi = Get-Item -LiteralPath $LogPath
 if ($fi.Length -lt [int64]$state["offset"]) { $state["offset"] = 0 }
 
-# Read new bytes since last offset
+# Read new bytes
 $fs = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
 $newLines = New-Object System.Collections.Generic.List[string]
 try {
   $fs.Seek([int64]$state["offset"], [System.IO.SeekOrigin]::Begin) | Out-Null
   $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8, $true, 4096, $true)
-
   while (-not $sr.EndOfStream) {
     $line = $sr.ReadLine()
     if ($null -ne $line) { $newLines.Add($line) }
   }
-
   $state["offset"] = $fs.Position
 }
 finally { $fs.Dispose() }
 
-# Parse timestamp like: [25-01-26 12:32:55.070]
+# PZ console timestamp: [25-01-26 12:32:55.070]
 $tsRe = [regex]'^\[(\d{2})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]'
 
 function Parse-Timestamp([string]$line) {
   $m = $tsRe.Match($line)
   if (-not $m.Success) { return $null }
-
   $yy = [int]$m.Groups[1].Value
   $MM = [int]$m.Groups[2].Value
   $dd = [int]$m.Groups[3].Value
   $HH = [int]$m.Groups[4].Value
   $mm = [int]$m.Groups[5].Value
   $ss = [int]$m.Groups[6].Value
-
   $fff = 0
   if ($m.Groups[7].Success) {
     $fffStr = $m.Groups[7].Value
@@ -132,10 +152,8 @@ function Parse-Timestamp([string]$line) {
     elseif ($fffStr.Length -eq 2) { $fff = [int]($fffStr + "0") }
     else { $fff = [int]$fffStr }
   }
-
   $year = 2000 + $yy
-  try { return [datetime]::new($year, $MM, $dd, $HH, $mm, $ss, $fff) }
-  catch { return $null }
+  try { return [datetime]::new($year, $MM, $dd, $HH, $mm, $ss, $fff) } catch { return $null }
 }
 
 function HourKey([datetime]$dt) { $dt.ToString("yyyyMMddHH") }
@@ -158,41 +176,37 @@ function IncBucket([string]$k, [string]$field, [int]$delta = 1) {
   $buckets[$k][$field] = [int]$buckets[$k][$field] + $delta
 }
 
-# Classification
+# Counts
 $newCritical = New-Object System.Collections.Generic.List[string]
 $newCounts = @{ warn = 0; error = 0; stack = 0 }
 $ignoredCounts = @{ warn = 0; error = 0; stack = 0 }
+
 $now = Get-Date
 
-function Is-NewEntryLine([string]$line) {
-  return ($tsRe.IsMatch($line))
-}
+function Is-NewEntryLine([string]$line) { return ($tsRe.IsMatch($line)) }
 
 for ($i = 0; $i -lt $newLines.Count; $i++) {
   $line = $newLines[$i]
   $upper = $line.ToUpperInvariant()
 
-  $isWarn = ($upper -match '\bWARN\b')
-  $isStackStart = ($upper -match 'STACK TRACE') -or ($upper -match 'STACKTRACE') # matches "Stack trace:" too after ToUpper
+  $isWarn  = $upper -match '\bWARN\b'
+  $isStackStart = ($upper -match 'STACK TRACE') -or ($upper -match 'STACKTRACE')
   $isError = (-not $isStackStart) -and ($upper -match '\bERROR\b')
 
   if (-not ($isWarn -or $isError -or $isStackStart)) { continue }
 
-  # Ignore line-based WARN/ERROR
+  $dt = Parse-Timestamp $line
+  if ($null -eq $dt) { $dt = $now }
+  $hk = HourKey $dt
+
+  # Ignore warn/error on the line itself
   if (($isWarn -or $isError) -and (Is-IgnoredText $line)) {
     if ($isWarn)  { $ignoredCounts["warn"]++ }
     if ($isError) { $ignoredCounts["error"]++ }
     continue
   }
 
-  $dt = Parse-Timestamp $line
-  if ($null -eq $dt) { $dt = $now }
-  $hk = HourKey $dt
-
-  if ($isWarn) {
-    IncBucket $hk "warn" 1
-    $newCounts["warn"]++
-  }
+  if ($isWarn)  { IncBucket $hk "warn"  1; $newCounts["warn"]++ }
 
   if ($isError) {
     IncBucket $hk "error" 1
@@ -201,22 +215,21 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
   }
 
   if ($isStackStart) {
+    # Capture stack block (~20 lines)
     $block = New-Object System.Collections.Generic.List[string]
 
-    # include previous lines as context (even if timestamped)
-    $prevTake = 3
-    for ($b = $prevTake; $b -ge 1; $b--) {
+    # include up to 2 previous non-entry lines as context
+    for ($b = 2; $b -ge 1; $b--) {
       $pi = $i - $b
       if ($pi -ge 0) {
         $prev = $newLines[$pi]
-        if (-not [string]::IsNullOrWhiteSpace($prev)) { $block.Add($prev) }
+        if (-not (Is-NewEntryLine $prev)) { $block.Add($prev) }
       }
     }
 
     $block.Add($line)
 
-    # follow lines (more than 20 to be more useful)
-    $maxFollow = 40
+    $maxFollow = 20
     for ($j = 1; $j -le $maxFollow; $j++) {
       $k = $i + $j
       if ($k -ge $newLines.Count) { break }
@@ -225,7 +238,7 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
       $block.Add($next)
     }
 
-    # move forward
+    # skip consumed lines
     $i = $i + ($block.Count - 1)
 
     $blockText = ($block -join "`n")
@@ -237,6 +250,7 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
 
     IncBucket $hk "stack" 1
     $newCounts["stack"]++
+
     if ($newCritical.Count -lt $MaxCriticalLines) { $newCritical.Add($blockText) }
   }
 }
@@ -253,7 +267,6 @@ foreach ($k in @($buckets.Keys)) {
 function Sum-Window([timespan]$span) {
   $from = (Get-Date).Add(-$span)
   $sum = @{ warn = 0; error = 0; stack = 0 }
-
   foreach ($k in $buckets.Keys) {
     if ($k -notmatch '^\d{10}$') { continue }
     $dt = [datetime]::ParseExact($k, "yyyyMMddHH", $null)
@@ -268,11 +281,15 @@ function Sum-Window([timespan]$span) {
 
 $stats1h  = Sum-Window ([timespan]::FromHours(1))
 $stats24h = Sum-Window ([timespan]::FromHours(24))
+$stats3d  = Sum-Window ([timespan]::FromDays(3))
+$stats7d  = Sum-Window ([timespan]::FromDays(7))
 $stats30d = Sum-Window ([timespan]::FromDays(30))
 
+# persist
 Save-Json $stateFile  $state
 Save-Json $bucketFile $buckets
 
+# output JSON
 $out = @{
   log_path = $LogPath
   scanned_new_lines = $newLines.Count
@@ -283,13 +300,16 @@ $out = @{
   new_critical_lines = $newCritical
   stats_1h  = $stats1h
   stats_24h = $stats24h
+  stats_3d  = $stats3d
+  stats_7d  = $stats7d
   stats_30d = $stats30d
   timestamp = (Get-Date).ToString("o")
   ignored_warn  = $ignoredCounts["warn"]
   ignored_error = $ignoredCounts["error"]
   ignored_stack = $ignoredCounts["stack"]
   ignored_total = ($ignoredCounts["warn"] + $ignoredCounts["error"] + $ignoredCounts["stack"])
-  ignore_regex  = $IgnoreRegex
+  ignore_file   = $IgnoreFile
+  ignore_regex  = (($ignorePatterns | Select-Object -Unique) -join ";")
 }
 
 $out | ConvertTo-Json -Depth 10

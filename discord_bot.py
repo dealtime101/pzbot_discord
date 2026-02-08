@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Optional
-
+from pathlib import Path
 import discord
 from discord import app_commands
 
@@ -107,6 +107,42 @@ def parse_status_with_players(out: str) -> tuple[str, str]:
     m = re.search(r"(?i)\bplayers\s*=\s*(\d+|\?)\b", t)
     players = m.group(1) if m else "?"
     return status, players
+
+IGNORE_FILE = Path(cfg.LOG_DIR) / "pz_ignore_regex.txt"
+
+def load_ignore_patterns() -> list[str]:
+    try:
+        if not IGNORE_FILE.exists():
+            return []
+        lines = IGNORE_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        out: list[str] = []
+        for ln in lines:
+            t = ln.strip()
+            if not t or t.startswith("#"):
+                continue
+            out.append(t)
+        # unique while preserving order
+        seen = set()
+        uniq = []
+        for p in out:
+            if p not in seen:
+                uniq.append(p)
+                seen.add(p)
+        return uniq
+    except Exception:
+        return []
+
+def save_ignore_patterns(patterns: list[str]) -> None:
+    IGNORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(patterns).strip() + ("\n" if patterns else "")
+    IGNORE_FILE.write_text(text, encoding="utf-8")
+
+def validate_regex(pat: str) -> tuple[bool, str]:
+    try:
+        re.compile(pat)
+        return True, ""
+    except re.error as e:
+        return False, str(e)
 
 
 # ------------------ Severity styles ------------------
@@ -276,7 +312,12 @@ async def run_workshop_check() -> tuple[int, str]:
 
 
 async def run_logscan() -> tuple[int, str]:
-    return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_LOGSCAN_PS1, ["-LogPath", cfg.PZ_CONSOLE_LOG])
+    return await run_powershell_script(
+        cfg.POWERSHELL_EXE,
+        cfg.PZ_LOGSCAN_PS1,
+        ["-LogPath", cfg.PZ_CONSOLE_LOG, "-IgnoreFile", str(IGNORE_FILE)],
+    )
+
 
 
 def log_action(i: discord.Interaction, action: str, exit_code: int, out: str):
@@ -455,25 +496,32 @@ async def pz_help(i: discord.Interaction):
     desc = (
         f"**PZBot v{BOT_VERSION}**\n\n"
         "**Commands**\n"
-        "• `/pz_status` — server status + online players\n"
+        "• `/pz_status` — show server status + online players\n"
         "• `/pz_players` — list online players\n"
-        "• `/pz_logstats` — console log stats (1h/24h/30d)\n"
-        "• `/pz_workshop_check` — workshop check (webhook)\n"
-        "• `/pz_save` — save world (sensitive)\n"
-        "• `/pz_stop` — stop server (sensitive, confirmation)\n"
-        "• `/pz_start` — start server (sensitive, confirmation)\n"
-        "• `/pz_restart` — restart server (sensitive, confirmation)\n"
-        "• `/pz_grant @user` — grant PZ role\n"
-        "• `/pz_revoke @user` — revoke PZ role\n"
-        "• `/pz_version` — bot version\n"
-        "• `/pz_ping` — healthcheck\n\n"
-        "**Monitoring**\n"
-        "• Console ERROR/STACK alerts are posted to **#bugs-reports**\n\n"
-        "**Access**\n"
+        "• `/pz_logstats` — log counters (last 1h / 24h / 30d)\n"
+        "• `/pz_workshop_check` — check Workshop updates (webhook)\n"
+        "• `/pz_ping` — bot healthcheck\n"
+        "• `/pz_version` — show bot version / build info\n\n"
+
+        "**Log ignore list (persistent)**\n"
+        "• `/pz_ignore_add <regex>` — add ignore regex\n"
+        "• `/pz_ignore_remove <regex>` — remove ignore regex (exact match)\n"
+        "• `/pz_ignore_list` — show ignore regex list\n\n"
+
+        "**Sensitive commands (admin only)**\n"
+        "• `/pz_save` — save world now\n"
+        "• `/pz_stop` — stop server (confirm)\n"
+        "• `/pz_start` — start server (confirm)\n"
+        "• `/pz_restart` — restart server (confirm)\n"
+        "• `/pz_grant @user` — grant PZ role (confirm)\n"
+        "• `/pz_revoke @user` — revoke PZ role (confirm)\n\n"
+
+        "**Access rules**\n"
         f"• Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
         "• OR Discord `Administrator`\n"
         "• OR (if enabled) channel perms: `manage_guild` / `manage_channels` / `manage_messages`\n\n"
-        f"**Cooldown:** {cfg.COOLDOWN_SECONDS}s  |  **Confirm window:** {cfg.CONFIRM_SECONDS}s\n"
+        f"**Cooldown**: {cfg.COOLDOWN_SECONDS}s (sensitive commands)\n"
+        f"**Confirm timeout**: {cfg.CONFIRM_SECONDS}s (stop/start/restart/grant/revoke)\n"
     )
     await i.response.send_message(embed=make_embed("PZ — Help", desc, SEV_BLUE), ephemeral=True)
 
@@ -524,19 +572,25 @@ async def pz_logstats(i: discord.Interaction):
         return
 
     payload = _parse_logscan_json(out)
-    s1 = payload.get("stats_1h") or {}
-    s24 = payload.get("stats_24h") or {}
-    s30 = payload.get("stats_30d") or {}
 
-    warn = _safe_int(s1.get("warn", 0))
-    error = _safe_int(s1.get("error", 0))
-    stack = _safe_int(s1.get("stack", 0))
-    color, emoji = severity_style(warn, error, stack)
+def _w(s: dict, k: str) -> int:
+    try:
+        return int(s.get(k, 0) or 0)
+    except Exception:
+        return 0
 
-    desc = (
-        f"**Last 1h** — WARN `{warn}`, ERROR `{error}`, STACK `{stack}`\n"
-        f"**Last 24h** — WARN `{_safe_int(s24.get('warn',0))}`, ERROR `{_safe_int(s24.get('error',0))}`, STACK `{_safe_int(s24.get('stack',0))}`\n"
-        f"**Last 30d** — WARN `{_safe_int(s30.get('warn',0))}`, ERROR `{_safe_int(s30.get('error',0))}`, STACK `{_safe_int(s30.get('stack',0))}`\n\n"
+        w1 = _w(stats1h, "warn");  e1 = _w(stats1h, "error");  s1 = _w(stats1h, "stack")
+        w24 = _w(stats24h, "warn"); e24 = _w(stats24h, "error"); s24 = _w(stats24h, "stack")
+        w3 = _w(stats3d, "warn");  e3 = _w(stats3d, "error");  s3 = _w(stats3d, "stack")
+        w7 = _w(stats7d, "warn");  e7 = _w(stats7d, "error");  s7 = _w(stats7d, "stack")
+        w30 = _w(stats30d, "warn"); e30 = _w(stats30d, "error"); s30 = _w(stats30d, "stack")
+
+        desc = (
+        f"**Last 1h**  — WARN: `{w1}`  ERROR: `{e1}`  STACK: `{s1}`\n"
+        f"**Last 24h** — WARN: `{w24}` ERROR: `{e24}` STACK: `{s24}`\n"
+        f"**Last 3d**  — WARN: `{w3}`  ERROR: `{e3}`  STACK: `{s3}`\n"
+        f"**Last 7d**  — WARN: `{w7}`  ERROR: `{e7}`  STACK: `{s7}`\n"
+        f"**Last 30d** — WARN: `{w30}` ERROR: `{e30}` STACK: `{s30}`\n"
         f"**Log:** `{payload.get('log_path','')}`"
     )
     emb = discord.Embed(title=f"{emoji} PZ — Log Stats", description=desc, color=color)
@@ -655,6 +709,69 @@ async def pz_revoke(i: discord.Interaction, user: discord.Member):
 
     view = ConfirmView(cfg, PendingAction("revoke", time.time(), i.user.id), do_revoke)
     await i.response.send_message(embed=make_embed("Confirmation required", f"Revoke PZ role from {user.mention}?", SEV_ORANGE), view=view, ephemeral=True)
+
+@tree.command(name="pz_ignore_list", description="Show ignore regex list (log scanner)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_ignore_list(i: discord.Interaction):
+    if await require_admin(cfg, i) is None:
+        return
+
+    pats = load_ignore_patterns()
+    if not pats:
+        emb = make_embed("PZ — Ignore List", f"No ignore patterns.\nFile: `{str(IGNORE_FILE)}`", SEV_GREEN)
+        await i.response.send_message(embed=emb, ephemeral=True)
+        return
+
+    body = "\n".join([f"• `{p}`" for p in pats[:40]])
+    if len(pats) > 40:
+        body += f"\n… (+{len(pats)-40} more)"
+    emb = make_embed("PZ — Ignore List", f"{body}\n\nFile: `{str(IGNORE_FILE)}`", SEV_BLUE)
+    await i.response.send_message(embed=emb, ephemeral=True)
+
+
+@tree.command(name="pz_ignore_add", description="Add ignore regex (log scanner)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(pattern="Regex pattern to ignore")
+async def pz_ignore_add(i: discord.Interaction, pattern: str):
+    if await require_admin(cfg, i) is None:
+        return
+
+    pat = (pattern or "").strip()
+    ok, err = validate_regex(pat)
+    if not pat or not ok:
+        emb = make_embed("PZ — Ignore Add", f"Invalid regex.\n`{err}`", SEV_RED)
+        await i.response.send_message(embed=emb, ephemeral=True)
+        return
+
+    pats = load_ignore_patterns()
+    if pat in pats:
+        emb = make_embed("PZ — Ignore Add", "Already in ignore list.", SEV_ORANGE)
+        await i.response.send_message(embed=emb, ephemeral=True)
+        return
+
+    pats.append(pat)
+    save_ignore_patterns(pats)
+
+    emb = make_embed("PZ — Ignore Add", f"Added:\n`{pat}`\n\nTotal: `{len(pats)}`", SEV_GREEN)
+    await i.response.send_message(embed=emb, ephemeral=True)
+
+
+@tree.command(name="pz_ignore_remove", description="Remove ignore regex (log scanner)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(pattern="Exact regex pattern to remove")
+async def pz_ignore_remove(i: discord.Interaction, pattern: str):
+    if await require_admin(cfg, i) is None:
+        return
+
+    pat = (pattern or "").strip()
+    pats = load_ignore_patterns()
+    if pat not in pats:
+        emb = make_embed("PZ — Ignore Remove", "Pattern not found (must match exactly).", SEV_ORANGE)
+        await i.response.send_message(embed=emb, ephemeral=True)
+        return
+
+    pats = [p for p in pats if p != pat]
+    save_ignore_patterns(pats)
+
+    emb = make_embed("PZ — Ignore Remove", f"Removed:\n`{pat}`\n\nTotal: `{len(pats)}`", SEV_GREEN)
+    await i.response.send_message(embed=emb, ephemeral=True)
 
 
 # ------------------ Events ------------------

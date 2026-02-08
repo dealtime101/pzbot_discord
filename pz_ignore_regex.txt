@@ -1,0 +1,7 @@
+mods isn't a valid workshop item ID
+ERROR:\s+IsoThumpable\s+not\s+found
+PacketTypes.*AnimalPacket
+ERROR:\s+template
+AnimalEventPacket
+PacketTypes\$\PacketType
+Simon est un noob
