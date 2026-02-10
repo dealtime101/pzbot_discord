@@ -5,24 +5,61 @@ import os
 import re
 from dataclasses import dataclass
 
-# Bot version (SemVer)
-BOT_VERSION = "1.3.4"
+# SemVer (also overridable via env PZBOT_VERSION)
+BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.7").strip() or "1.3.7"
 
 
-def _env(name: str, default: str | None = None) -> str:
+def _getenv_raw(name: str, default: str | None = None) -> str | None:
     v = os.environ.get(name, default)
-    if v is None or str(v).strip() == "":
+    if v is None:
+        return None
+    v = str(v).strip()
+    return v if v != "" else None
+
+
+def _env_required(name: str) -> str:
+    v = _getenv_raw(name)
+    if v is None:
         raise RuntimeError(f"Missing environment variable: {name}")
-    return str(v).strip()
+    return v
 
 
-def _env_int_flexible(name: str, default: str | None = None) -> int:
-    """Accept plain integers or mention-like values: <123>, <@123>, <@&123>."""
-    raw = _env(name, default)
-    digits = re.sub(r"\D+", "", raw)
-    if digits == "":
-        raise ValueError(f"{name} must be an integer (got: {raw!r})")
-    return int(digits)
+def _parse_discord_id(value: str, var_name: str) -> int:
+    """
+    Accepts:
+      - 725383719455817758
+      - <725383719455817758>
+      - <@725383719455817758>
+      - <@&725383719455817758>
+    """
+    m = re.search(r"\d+", value)
+    if not m:
+        raise ValueError(f"{var_name} must contain a numeric ID (got: {value!r})")
+    return int(m.group(0))
+
+
+def _env_int_required(name: str) -> int:
+    v = _env_required(name)
+    return _parse_discord_id(v, name)
+
+
+def _env_str(name: str, default: str) -> str:
+    v = _getenv_raw(name, default)
+    return (v if v is not None else default).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    v = _getenv_raw(name, str(default))
+    if v is None:
+        return default
+    return _parse_discord_id(v, name)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = _getenv_raw(name, None)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 @dataclass(frozen=True)
@@ -31,73 +68,77 @@ class Config:
     DISCORD_BOT_TOKEN: str
     DISCORD_GUILD_ID: int
     PZ_ADMIN_ROLE_ID: int
-    DISCORD_BUGS_CHANNEL_ID: int
 
-    # Optional mention string (e.g. "<@&123>" or "@here" or "")
-    DISCORD_PING_ON_UPDATE: str
+    # Bug / logscan
+    DISCORD_BUGS_CHANNEL_ID: int
+    PZ_LOGSCAN_PS1: str
+    PZ_CONSOLE_LOG: str
+    PZ_LOGSCAN_INTERVAL_SECONDS: int
+    PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS: int
+    PZ_LOGSCAN_DEDUP_SECONDS: int
 
     # Paths
     POWERSHELL_EXE: str
     PZ_CONTROL_PS1: str
     WORKSHOP_CHECK_PS1: str
-    PZ_LOGSCAN_PS1: str
-    PZ_CONSOLE_LOG: str
+    PZ_IGNORE_FILE: str
 
     # Behaviour
     ALLOW_CHANNEL_PERMS: bool
     CONFIRM_SECONDS: int
     COOLDOWN_SECONDS: int
     STATUS_REFRESH_SECONDS: int
-    PZ_LOGSCAN_INTERVAL_SECONDS: int
-
-    # Dedup / alert pacing
-    PZ_LOG_DEDUP_SECONDS: int
-    PZ_ALERT_MIN_INTERVAL_SECONDS: int
 
     # Logging
     LOG_DIR: str
     BOT_LOG_FILE: str
     ACTION_AUDIT_LOG: str
 
-    # Nickname
-    DISCORD_BOT_NICKNAME: str
+    # Optional
+    DISCORD_PING_ON_UPDATE: str
+    BOT_VERSION: str
 
 
 def load_config() -> Config:
-    base = r"C:\PZServerBuild42"
-    log_dir = os.environ.get("PZ_LOG_DIR", r"C:\PZ_MaintenanceLogs").strip()
+    base = _env_str("PZ_BASE_DIR", r"C:\PZServerBuild42")
+    log_dir = _env_str("PZ_LOG_DIR", r"C:\PZ_MaintenanceLogs")
+    pz_ignore_file = _env_str("PZ_IGNORE_FILE", "")
 
     return Config(
-        DISCORD_BOT_TOKEN=_env("DISCORD_BOT_TOKEN"),
-        DISCORD_GUILD_ID=_env_int_flexible("DISCORD_GUILD_ID"),
-        PZ_ADMIN_ROLE_ID=_env_int_flexible("PZ_ADMIN_ROLE_ID"),
-        DISCORD_BUGS_CHANNEL_ID=_env_int_flexible("DISCORD_BUGS_CHANNEL_ID", "0"),
-        DISCORD_PING_ON_UPDATE=os.environ.get("DISCORD_PING_ON_UPDATE", "").strip(),
+        # Discord
+        DISCORD_BOT_TOKEN=_env_required("DISCORD_BOT_TOKEN"),
+        DISCORD_GUILD_ID=_env_int_required("DISCORD_GUILD_ID"),
+        PZ_ADMIN_ROLE_ID=_env_int("PZ_ADMIN_ROLE_ID", 0),
 
-        POWERSHELL_EXE=os.environ.get(
+        # Bug/logscan
+        DISCORD_BUGS_CHANNEL_ID=_env_int("DISCORD_BUGS_CHANNEL_ID", 0),
+        PZ_LOGSCAN_PS1=_env_str("PZ_LOGSCAN_PS1", rf"{base}\pz_logscan.ps1"),
+        PZ_CONSOLE_LOG=_env_str("PZ_CONSOLE_LOG", rf"{base}\hh_saves\Zomboid\server-console.txt"),
+        PZ_LOGSCAN_INTERVAL_SECONDS=_env_int("PZ_LOGSCAN_INTERVAL_SECONDS", 25),
+        PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS=_env_int("PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS", 30),
+        PZ_LOGSCAN_DEDUP_SECONDS=_env_int("PZ_LOGSCAN_DEDUP_SECONDS", 600),
+
+        # Paths
+        POWERSHELL_EXE=_env_str(
             "POWERSHELL_EXE",
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         ),
-        PZ_CONTROL_PS1=os.environ.get("PZ_CONTROL_PS1", rf"{base}\pz_control.ps1"),
-        WORKSHOP_CHECK_PS1=os.environ.get("WORKSHOP_CHECK_PS1", rf"{base}\pzbot_workshop_check.ps1"),
-        PZ_LOGSCAN_PS1=os.environ.get("PZ_LOGSCAN_PS1", rf"{base}\pz_logscan.ps1"),
-        PZ_CONSOLE_LOG=os.environ.get(
-            "PZ_CONSOLE_LOG",
-            os.path.join(os.environ.get("USERPROFILE", r"C:\Users\Public"), "Zomboid", "server-console.txt"),
-        ),
+        PZ_CONTROL_PS1=_env_str("PZ_CONTROL_PS1", rf"{base}\pz_control.ps1"),
+        WORKSHOP_CHECK_PS1=_env_str("WORKSHOP_CHECK_PS1", rf"{base}\pzbot_workshop_check.ps1"),
+        PZ_IGNORE_FILE=pz_ignore_file,
 
-        ALLOW_CHANNEL_PERMS=os.environ.get("PZ_ALLOW_CHANNEL_PERMS", "true").lower() == "true",
-        CONFIRM_SECONDS=int(os.environ.get("PZ_CONFIRM_SECONDS", "20")),
-        COOLDOWN_SECONDS=int(os.environ.get("PZ_COOLDOWN_SECONDS", "10")),
-        STATUS_REFRESH_SECONDS=int(os.environ.get("PZ_STATUS_REFRESH_SECONDS", "30")),
-        PZ_LOGSCAN_INTERVAL_SECONDS=int(os.environ.get("PZ_LOGSCAN_INTERVAL_SECONDS", "25")),
+        # Behaviour
+        ALLOW_CHANNEL_PERMS=_env_bool("PZ_ALLOW_CHANNEL_PERMS", True),
+        CONFIRM_SECONDS=_env_int("PZ_CONFIRM_SECONDS", 20),
+        COOLDOWN_SECONDS=_env_int("PZ_COOLDOWN_SECONDS", 10),
+        STATUS_REFRESH_SECONDS=_env_int("PZ_STATUS_REFRESH_SECONDS", 30),
 
-        PZ_LOG_DEDUP_SECONDS=int(os.environ.get("PZ_LOG_DEDUP_SECONDS", "600")),  # 10 min
-        PZ_ALERT_MIN_INTERVAL_SECONDS=int(os.environ.get("PZ_ALERT_MIN_INTERVAL_SECONDS", "15")),
-
+        # Logging
         LOG_DIR=log_dir,
         BOT_LOG_FILE=os.path.join(log_dir, "pz_discord_bot.log"),
         ACTION_AUDIT_LOG=os.path.join(log_dir, "pz_discord_actions.log"),
 
-        DISCORD_BOT_NICKNAME=os.environ.get("DISCORD_BOT_NICKNAME", "PZBot").strip() or "PZBot",
+        # Optional
+        DISCORD_PING_ON_UPDATE=_env_str("DISCORD_PING_ON_UPDATE", ""),
+        BOT_VERSION=BOT_VERSION,
     )

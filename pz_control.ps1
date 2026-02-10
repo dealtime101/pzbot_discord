@@ -1,4 +1,5 @@
-﻿# pz_control.ps1
+﻿# pz_control.ps1 (PS 5.1)
+# Actions: status | players | save | start | stop | restart | say
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)]
@@ -23,9 +24,6 @@ $McrconExe = $env:PZ_MCRCON_EXE
 if ([string]::IsNullOrWhiteSpace($McrconExe)) {
   $McrconExe = Join-Path $Base "tools\mcrcon.exe"
 }
-
-$RconHost = $env:PZ_RCON_HOST
-if ([string]::IsNullOrWhiteSpace($RconHost)) { $RconHost = "127.0.0.1" }
 
 function Write-Out([string]$s) {
   if ([string]::IsNullOrWhiteSpace($s)) { $s = "(no output)" }
@@ -61,129 +59,162 @@ function Get-ServerIniPath {
 
 function Get-RconConfig {
   $ini = Get-ServerIniPath
-  if (-not (Test-Path -LiteralPath $ini)) { return $null }
-
-  $port = $null
-  $pass = $null
-  foreach ($line in (Get-Content -LiteralPath $ini -ErrorAction Stop)) {
-    if ($line -match '^\s*RCONPort\s*=\s*(\d+)\s*$')      { $port = [int]$matches[1]; continue }
-    if ($line -match '^\s*RCONPassword\s*=\s*(.+?)\s*$') { $pass = $matches[1].Trim(); continue }
+  if (-not (Test-Path -LiteralPath $ini)) {
+    throw "Server ini not found: $ini"
   }
 
-  if ($null -eq $port -or [string]::IsNullOrWhiteSpace($pass)) { return $null }
-  [pscustomobject]@{ Port = $port; Pass = $pass }
-}
+  $port = 27015
+  $pass = ""
 
-# Interactive mcrcon (stdin) so output is reliably captured
-function Invoke-Mcrcon([string]$Command) {
-  if (-not (Test-Path -LiteralPath $McrconExe)) {
-    throw "mcrcon.exe not found: $McrconExe (set PZ_MCRCON_EXE or place it under $Base\tools\mcrcon.exe)"
-  }
-
-  $cfg = Get-RconConfig
-  if ($null -eq $cfg) {
-    throw "RCONPort/RCONPassword not found in $(Get-ServerIniPath)"
-  }
-
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $McrconExe
-  $psi.Arguments = "-H $RconHost -P $($cfg.Port) -p `"$($cfg.Pass)`""
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardInput  = $true
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError  = $true
-  $psi.CreateNoWindow = $true
-
-  $p = New-Object System.Diagnostics.Process
-  $p.StartInfo = $psi
-
-  if (-not $p.Start()) { throw "Unable to start mcrcon.exe" }
-
-  $p.StandardInput.WriteLine($Command)
-  $p.StandardInput.WriteLine("exit")
-  $p.StandardInput.Flush()
-  $p.StandardInput.Close()
-
-  $stdout = $p.StandardOutput.ReadToEnd()
-  $stderr = $p.StandardError.ReadToEnd()
-  $p.WaitForExit(5000) | Out-Null
-
-  $out = (($stdout + "`n" + $stderr) -replace "`r","").Trim()
-  if ($out -match '(?i)\bconnection failed\b') {
-    throw "Connection failed (RCON host/port/pass?)"
-  }
-  return $out
-}
-
-function Extract-PlayersFromOutput([string]$raw) {
-  if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
-
-  $lines = $raw -split "`n" |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -ne "" }
-
-  # Remove headers/noise
-  $lines = $lines | Where-Object {
-    $_ -notmatch '^(?i)(players connected|connected players|players online|online players|usage|help|authenticated|connecting|mcrcon|>)\b'
-  }
-
-  $names = New-Object System.Collections.Generic.List[string]
-
+  $lines = Get-Content -LiteralPath $ini -ErrorAction Stop
   foreach ($l in $lines) {
-    $s = $l.Trim()
+    if ($l -match '^\s*RCONPort\s*=\s*(\d+)\s*$') { $port = [int]$matches[1] ; continue }
+    if ($l -match '^\s*RCONPassword\s*=\s*(.+?)\s*$') { $pass = $matches[1].Trim() ; continue }
+  }
 
-    # PZ format: "-name"
-    $s = $s -replace '^\-+\s*', ''
+  if ([string]::IsNullOrWhiteSpace($pass)) {
+    throw "RCONPassword is empty in $ini"
+  }
 
-    # Strip list index "1. Name"
-    if ($s -match '^\s*\d+\s*[\.\)\-:]\s*(.+)$') { $s = $matches[1].Trim() }
+  return @{
+    Port = $port
+    Pass = $pass
+    Ini  = $ini
+  }
+}
 
-    # Keep name before extra info
-    $s = ($s -split '\s+\(|\s+\[|\s+-\s+|\s+steamid\s*[:=]\s*', 2)[0].Trim()
+function Invoke-Mcrcon([string]$command) {
+  if (-not (Test-Path -LiteralPath $McrconExe)) {
+    throw "mcrcon.exe not found: $McrconExe"
+  }
 
-    if ($s -match '^[A-Za-z0-9_\-\.]{2,32}$') {
-      $names.Add($s)
+  $rc = Get-RconConfig
+  $port = $rc.Port
+  $pass = $rc.Pass
+
+  # NOTE: mcrcon works for sending but returns empty output for PZ B42 on some setups.
+  # We still run it and trust exit code.
+  $out = & $McrconExe -H 127.0.0.1 -P $port -p $pass $command 2>&1
+  $code = $LASTEXITCODE
+
+  if ($code -ne 0) {
+    $msg = ($out | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "mcrcon exit code $code" }
+    throw $msg
+  }
+
+  return ($out | Out-String).Trim()
+}
+
+# ===== Console-based player detection (works even when mcrcon output is empty) =====
+function Get-ConsoleLogPath {
+  $userHome = Get-UserHomeFromStartBat $StartBat
+  return (Join-Path $userHome "Zomboid\server-console.txt")
+}
+
+function Get-ConsoleTail([string]$path, [int]$tail = 5000) {
+  if (-not (Test-Path $path)) { return @() }
+  try {
+    return Get-Content -Path $path -Tail $tail -ErrorAction Stop
+  } catch {
+    return @()
+  }
+}
+
+function Get-ActiveGuidsFromConsole([string]$consolePath) {
+  $lines = Get-ConsoleTail $consolePath 7000
+  if ($lines.Count -eq 0) { return @() }
+
+  # Keep last known state per guid
+  $lastState = @{}  # guid -> string
+
+  foreach ($line in $lines) {
+    if ($line -notmatch 'guid=(\d+)') { continue }
+    $guid = $matches[1]
+
+    # 1) Fully connected is the strongest signal
+    if ($line -match '\[fully-connected\]') {
+      $lastState[$guid] = "connected"
+      continue
+    }
+
+    # 2) player-connect packet also indicates active player
+    if ($line -match '\[receive-packet\]\s+"player-connect"') {
+      $lastState[$guid] = "connected"
+      continue
+    }
+
+    # 3) disconnect/closed/lost patterns
+    if ($line -match '(?i)(disconnect|disconnected|connection-lost|lost-connection|closed|close-connection)') {
+      $lastState[$guid] = "disconnected"
+      continue
+    }
+
+    # 4) Other connection phases (don’t count as active)
+    if ($line -match '\[RakNet\]\s+"new-incoming-connection"') {
+      if (-not $lastState.ContainsKey($guid)) { $lastState[$guid] = "pending" }
+      continue
     }
   }
 
-  @($names.ToArray() | Sort-Object -Unique)
+  $active = @()
+  foreach ($k in $lastState.Keys) {
+    if ($lastState[$k] -eq "connected") { $active += $k }
+  }
+
+  return ($active | Sort-Object -Unique)
 }
 
-function Get-PlayersViaRcon {
-  $raw = Invoke-Mcrcon "players"
-  $players = Extract-PlayersFromOutput $raw
-  @($players)
+function Get-PlayersCountFromConsole([string]$consolePath) {
+  $guids = @(Get-ActiveGuidsFromConsole $consolePath)
+  return $guids.Count
 }
 
+function Get-PlayersListFromConsole([string]$consolePath) {
+  $guids = @(Get-ActiveGuidsFromConsole $consolePath)
+  if ($guids.Count -eq 0) { return @() }
+
+  # We don’t have names in your log sample; show GUIDs for now.
+  return ($guids | ForEach-Object { "guid=$_" })
+}
+
+# ===== Actions =====
 switch ($Action) {
 
   "status" {
     $proc = Get-PZServerProcess
     if ($null -eq $proc) { Write-Out "STOPPED | players=0"; exit 0 }
 
-    try {
-      $players = @(Get-PlayersViaRcon)
-      Write-Out ("RUNNING | players={0}" -f $players.Count)
-    } catch {
-      Write-Out "RUNNING | players=?"
-    }
+    $console = Get-ConsoleLogPath
+    $pc = Get-PlayersCountFromConsole $console
+    Write-Out ("RUNNING | players={0}" -f $pc)
     exit 0
   }
 
-  "players" {
-    $proc = Get-PZServerProcess
-    if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
+"players" {
+  $proc = Get-PZServerProcess
+  if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
 
-    try {
-      $players = @(Get-PlayersViaRcon)
-      if ($players.Count -eq 0) { Write-Out "(none)"; exit 0 }
-      $players | ForEach-Object { Write-Output $_ }
-      exit 0
-    } catch {
-      Write-Out ("ERROR: " + $_.Exception.Message)
-      exit 2
-    }
+  $rc = Get-RconConfig
+  $port = $rc.Port
+  $pass = $rc.Pass
+
+  $py = $env:PZ_PYTHON
+  if ([string]::IsNullOrWhiteSpace($py)) { $py = "python" }
+
+  $rconPy = Join-Path $Base "pz_rcon.py"
+  if (-not (Test-Path -LiteralPath $rconPy)) {
+    Write-Out "ERROR: pz_rcon.py not found: $rconPy"
+    exit 2
   }
+
+  $out = & $py $rconPy --port $port --password $pass --cmd "players" 2>&1
+  $txt = ($out | Out-String).Trim()
+
+  if ([string]::IsNullOrWhiteSpace($txt)) { Write-Out "(none)"; exit 0 }
+  Write-Output $txt
+  exit 0
+}
 
   "start" {
     if (-not (Test-Path -LiteralPath $StartBat)) {
@@ -238,9 +269,18 @@ switch ($Action) {
   "save" {
     $proc = Get-PZServerProcess
     if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
-    Write-Out "OK"
-    exit 0
+
+    try {
+      # Common PZ server command: "save"
+      [void](Invoke-Mcrcon "save")
+      Write-Out "OK"
+      exit 0
+    } catch {
+      Write-Out ("ERROR: " + $_.Exception.Message)
+      exit 2
+    }
   }
+
   "say" {
     $proc = Get-PZServerProcess
     if ($null -eq $proc) { Write-Out "STOPPED"; exit 0 }
@@ -250,13 +290,10 @@ switch ($Action) {
       exit 2
     }
 
-    # Escape quotes for safety
     $msg = $Message.Replace('"','\"')
 
     try {
-      # Project Zomboid supports 'servermsg' in many setups.
-      # If your server uses a different command, we can adjust.
-      $raw = Invoke-Mcrcon "servermsg `"$msg`""
+      [void](Invoke-Mcrcon "servermsg `"$msg`"")
       Write-Out "OK"
       exit 0
     } catch {

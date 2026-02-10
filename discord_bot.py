@@ -2,20 +2,23 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import discord
 from discord import app_commands
 
-from config import load_config, Config, BOT_VERSION
+from config import load_config, Config
 
+
+# ------------------ Config ------------------
+cfg = load_config()
 
 # ------------------ Logging ------------------
 def setup_logging(cfg: Config) -> logging.Logger:
@@ -23,6 +26,10 @@ def setup_logging(cfg: Config) -> logging.Logger:
 
     logger = logging.getLogger("pzbot")
     logger.setLevel(logging.INFO)
+
+    # Avoid duplicate handlers on restarts
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -34,12 +41,15 @@ def setup_logging(cfg: Config) -> logging.Logger:
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 
-    logger.info("=== PZBot logging started (v%s) ===", BOT_VERSION)
+    logger.info("=== PZBot logging started ===")
     logger.info("Log file: %s", cfg.BOT_LOG_FILE)
     return logger
 
 
-def audit_log(cfg: Config, line: str) -> None:
+logger = setup_logging(cfg)
+
+
+def audit_log(line: str) -> None:
     os.makedirs(cfg.LOG_DIR, exist_ok=True)
     with open(cfg.ACTION_AUDIT_LOG, "a", encoding="utf-8") as f:
         f.write(line.rstrip() + "\n")
@@ -50,9 +60,11 @@ async def run_powershell_script(ps_exe: str, script_path: str, args: list[str]) 
     cmd = [
         ps_exe,
         "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
+        "-ExecutionPolicy",
+        "Bypass",
         "-NonInteractive",
-        "-File", script_path,
+        "-File",
+        script_path,
         *args,
     ]
     p = await asyncio.create_subprocess_exec(
@@ -60,150 +72,125 @@ async def run_powershell_script(ps_exe: str, script_path: str, args: list[str]) 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await p.communicate()
+
+    timeout_s = int(os.environ.get("PZ_PS_TIMEOUT_SECONDS", "120"))
+    try:
+        out, _ = await asyncio.wait_for(p.communicate(), timeout=max(5, timeout_s))
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except Exception:
+            pass
+        return 124, f"Timed out after {timeout_s}s"
+
     text = (out or b"").decode("utf-8", errors="replace").strip()
     if not text:
         text = "(no output)"
-    # allow big outputs for logscan JSON
-    return p.returncode, text[:12000]
+    return p.returncode, text[:1800]
 
 
-def make_embed(title: str, description: str, color: int) -> discord.Embed:
-    emb = discord.Embed(title=title, description=description, color=color)
-    emb.timestamp = discord.utils.utcnow()
-    return emb
+SEV_GREEN = 0x2ecc71
+SEV_ORANGE = 0xF1C40F
+SEV_RED = 0xE74C3C
+SEV_BLUE = 0x3498DB
+
+
+def make_embed(title: str, desc: str, color: int) -> discord.Embed:
+    return discord.Embed(title=title, description=desc, color=color)
 
 
 def user_tag(i: discord.Interaction) -> str:
     u = i.user
-    return f"{u.name}({u.id})"
-
-
-def _safe_int(v, default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _codeblock(text: str, max_len: int = 1700) -> str:
-    t = (text or "").strip()
-    if len(t) > max_len:
-        t = t[: max_len - 3] + "..."
-    t = t.replace("```", "``\u200b`")
-    return f"```\n{t}\n```"
+    return f"{u.name}#{u.discriminator}" if getattr(u, "discriminator", None) else u.name
 
 
 def parse_status_with_players(out: str) -> tuple[str, str]:
-    t = (out or "").strip()
-    up = t.upper()
+    """
+    Matches pz_control.ps1 output:
+      RUNNING | players=3
+      STOPPED | players=0
+      RUNNING | players=?
+      STOPPED
+    """
+    s = (out or "").strip()
 
+    # Status is first token before space or |
     status = "UNKNOWN"
-    if "RUNNING" in up:
-        status = "RUNNING"
-    elif "STOPPED" in up:
-        status = "STOPPED"
+    m = re.match(r"^([A-Z_]+)", s)
+    if m:
+        status = m.group(1).strip()
 
-    m = re.search(r"(?i)\bplayers\s*=\s*(\d+|\?)\b", t)
-    players = m.group(1) if m else "?"
+    players = "?"
+    m = re.search(r"players\s*=\s*(\d+|\?)", s, flags=re.I)
+    if m:
+        players = m.group(1)
     return status, players
 
 
-# ------------------ Severity styles ------------------
-SEV_GREEN = 0x2ecc71
-SEV_ORANGE = 0xf39c12
-SEV_RED = 0xe74c3c
-SEV_BLUE = 0x3498db
+# ------------------ Permissions ------------------
+async def require_admin(cfg: Config, i: discord.Interaction) -> Optional[discord.Embed]:
+    """
+    Returns:
+      None if allowed
+      Embed (error) if denied
+    """
+    if not i.guild or not isinstance(i.user, discord.Member):
+        return make_embed("No guild context", "This command can only be used in a server.", SEV_RED)
 
+    member: discord.Member = i.user
+    perms = member.guild_permissions
 
-def severity_style(warn: int, error: int, stack: int) -> tuple[int, str]:
-    if error > 0 or stack > 0:
-        return SEV_RED, "🚨"
-    if warn > 0:
-        return SEV_ORANGE, "⚠️"
-    return SEV_GREEN, "✅"
-
-
-# ------------------ Permission model ------------------
-async def get_member(i: discord.Interaction) -> Optional[discord.Member]:
-    if i.guild is None:
-        return None
-    if isinstance(i.user, discord.Member):
-        return i.user
-    try:
-        return await i.guild.fetch_member(i.user.id)
-    except (discord.NotFound, discord.Forbidden):
+    if perms.administrator:
         return None
 
-
-def has_admin_role(cfg: Config, m: discord.Member) -> bool:
-    role_ids = getattr(m, "_roles", None)
-    if role_ids is not None:
-        return cfg.PZ_ADMIN_ROLE_ID in role_ids
-    return any(getattr(r, "id", None) == cfg.PZ_ADMIN_ROLE_ID for r in getattr(m, "roles", []))
-
-
-def has_discord_admin_perm(m: discord.Member) -> bool:
-    try:
-        return bool(m.guild_permissions.administrator)
-    except Exception:
-        return False
-
-
-def has_channel_permission(cfg: Config, i: discord.Interaction, m: discord.Member) -> bool:
-    if not cfg.ALLOW_CHANNEL_PERMS:
-        return False
-    if i.channel is None:
-        return False
-    perms = i.channel.permissions_for(m)
-    return perms.manage_guild or perms.manage_channels or perms.manage_messages
-
-
-async def require_admin(cfg: Config, i: discord.Interaction) -> Optional[discord.Member]:
-    m = await get_member(i)
-    if m is None:
-        await i.response.send_message(
-            embed=make_embed(
-                "Access denied",
-                "Unable to resolve the member. Make sure **Server Members Intent** is enabled.",
-                SEV_RED,
-            ),
-            ephemeral=True,
-        )
+    if cfg.PZ_ADMIN_ROLE_ID and any(r.id == cfg.PZ_ADMIN_ROLE_ID for r in member.roles):
         return None
 
-    if has_admin_role(cfg, m) or has_discord_admin_perm(m) or has_channel_permission(cfg, i, m):
-        return m
+    if cfg.ALLOW_CHANNEL_PERMS:
+        cp = i.channel.permissions_for(member) if i.channel else perms
+        if cp.manage_guild or cp.manage_channels or cp.manage_messages:
+            return None
 
-    await i.response.send_message(
-        embed=make_embed("Access denied", "You don't have permission to use this command.", SEV_RED),
-        ephemeral=True,
+    return make_embed(
+        "Access denied",
+        f"Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}> or Discord Administrator.",
+        SEV_RED,
     )
-    return None
 
 
-# ------------------ Cooldown ------------------
+async def deny_if_needed(i: discord.Interaction, m: Optional[discord.Embed]) -> bool:
+    """Returns True if denied (and responded), False if OK."""
+    if m is None:
+        return False
+    if i.response.is_done():
+        await i.followup.send(embed=m, ephemeral=True)
+    else:
+        await i.response.send_message(embed=m, ephemeral=True)
+    return True
+
+
+# ------------------ Cooldown / Confirm ------------------
 class Cooldown:
     def __init__(self, seconds: int):
-        self.seconds = seconds
-        self._last: dict[tuple[int, str], float] = {}
+        self.seconds = max(0, int(seconds))
+        self._last: dict[int, float] = {}
 
-    def check(self, user_id: int, key: str) -> bool:
+    def check(self, user_id: int) -> bool:
+        if self.seconds <= 0:
+            return True
         now = time.time()
-        k = (user_id, key)
-        last = self._last.get(k, 0.0)
+        last = self._last.get(user_id, 0.0)
         if now - last < self.seconds:
             return False
-        self._last[k] = now
+        self._last[user_id] = now
         return True
 
 
-# ------------------ Confirm buttons ------------------
 @dataclass
 class PendingAction:
     action: str
-    created_at: float
-    interaction_user_id: int
+    created_ts: float
+    owner_user_id: int
 
 
 class ConfirmView(discord.ui.View):
@@ -214,16 +201,21 @@ class ConfirmView(discord.ui.View):
         self.on_confirm = on_confirm
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.pending.interaction_user_id:
-            await interaction.response.send_message(
-                embed=make_embed("Confirmation", "Only the original requester can confirm.", SEV_RED),
-                ephemeral=True,
-            )
+        if interaction.user.id != self.pending.owner_user_id:
+            await interaction.response.send_message("Not your confirmation.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if time.time() - self.pending.created_ts > self.cfg.CONFIRM_SECONDS:
+            await interaction.response.edit_message(
+                embed=make_embed("Expired", "Confirmation window expired.", SEV_RED),
+                view=None,
+            )
+            self.stop()
+            return
+
         await self.on_confirm(interaction)
         self.stop()
 
@@ -236,37 +228,60 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 
-# ------------------ Bot ------------------
-cfg = load_config()
-logger = setup_logging(cfg)
 cooldown = Cooldown(cfg.COOLDOWN_SECONDS)
 
-intents = discord.Intents.default()
-intents.members = True  # for role checks
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-# Dedup cache (signature -> last seen timestamp)
-dedup_seen: dict[str, float] = {}
-last_alert_sent_at: float = 0.0
-
-_ts_prefix_re = re.compile(r"^\[[^\]]+\]\s*")
-_noise_re = re.compile(r"\b(f:\d+|t:\d+|st:[0-9,]+)\b", re.IGNORECASE)
+IGNORE_FILE = Path(cfg.PZ_IGNORE_FILE) if str(cfg.PZ_IGNORE_FILE).strip() else (Path(cfg.LOG_DIR) / "pz_ignore_regex.txt")
+DEDUP_FILE = Path(cfg.LOG_DIR) / "pz_bug_dedup.json"
 
 
-def normalize_critical_text(s: str) -> str:
-    t = (s or "").strip()
-    t = _ts_prefix_re.sub("", t)
-    t = _noise_re.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t[:1400]
+# ------------------ Ignore list helpers ------------------
+def load_ignore_patterns() -> list[str]:
+    try:
+        if not IGNORE_FILE.exists():
+            return []
+        lines = IGNORE_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        out: list[str] = []
+        for ln in lines:
+            t = ln.strip()
+            if not t or t.startswith("#"):
+                continue
+            out.append(t)
+        return out
+    except Exception:
+        logger.exception("Failed reading ignore file: %s", IGNORE_FILE)
+        return []
 
 
-def critical_signature(s: str) -> str:
-    norm = normalize_critical_text(s).encode("utf-8", errors="ignore")
-    return hashlib.sha1(norm).hexdigest()
+def save_ignore_patterns(patterns: list[str]) -> None:
+    IGNORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    txt = "\n".join(patterns) + ("\n" if patterns else "")
+    IGNORE_FILE.write_text(txt, encoding="utf-8")
 
 
+def validate_regex(rx: str) -> Optional[str]:
+    try:
+        re.compile(rx)
+        return None
+    except re.error as e:
+        return str(e)
+
+
+# ------------------ Dedup helpers ------------------
+def dedup_load() -> dict:
+    try:
+        if not DEDUP_FILE.exists():
+            return {}
+        return json.loads(DEDUP_FILE.read_text(encoding="utf-8", errors="replace") or "{}")
+    except Exception:
+        return {}
+
+
+def dedup_save(data: dict) -> None:
+    DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEDUP_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+# ------------------ Runners ------------------
 async def run_control(action: str) -> tuple[int, str]:
     return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_CONTROL_PS1, ["-Action", action])
 
@@ -276,405 +291,407 @@ async def run_workshop_check() -> tuple[int, str]:
 
 
 async def run_logscan() -> tuple[int, str]:
-    return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_LOGSCAN_PS1, ["-LogPath", cfg.PZ_CONSOLE_LOG])
+    args = ["-LogPath", cfg.PZ_CONSOLE_LOG, "-IgnoreFile", str(IGNORE_FILE)]
+    return await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_LOGSCAN_PS1, args)
 
 
-def log_action(i: discord.Interaction, action: str, exit_code: int, out: str):
-    g = i.guild.id if i.guild else 0
-    ch = i.channel.id if i.channel else 0
-    line = f"action={action} user={user_tag(i)} guild={g} channel={ch} exit={exit_code} out={out.replace(chr(10),'\\\\n')[:250]}"
-    logger.info(line)
-    audit_log(cfg, line)
-
-
-# ------------------ Nickname enforcement ------------------
-async def ensure_bot_nickname():
-    """Force bot nickname to cfg.DISCORD_BOT_NICKNAME (requires 'Change Nickname' or 'Manage Nicknames')."""
-    try:
-        guild = client.get_guild(cfg.DISCORD_GUILD_ID)
-        if guild is None:
-            guild = await client.fetch_guild(cfg.DISCORD_GUILD_ID)
-
-        me = guild.me
-        if me is None:
-            me = await guild.fetch_member(client.user.id)
-
-        if me and me.nick != cfg.DISCORD_BOT_NICKNAME:
-            await me.edit(nick=cfg.DISCORD_BOT_NICKNAME, reason="PZBot nickname enforcement")
-            logger.info("Nickname enforced: %s", cfg.DISCORD_BOT_NICKNAME)
-    except Exception as e:
-        # Don't crash; just log
-        logger.warning("Failed to enforce nickname: %s", e)
-
-
-# ------------------ Presence ------------------
-async def update_presence_loop():
-    await client.wait_until_ready()
-    while not client.is_closed():
+# ------------------ Discord Client ------------------
+class PZBotClient(discord.Client):
+    async def setup_hook(self):
+        # Sync slash commands to one guild (fast propagation)
         try:
-            _, out = await run_control("status")
-            status, players = parse_status_with_players(out)
-
-            if status == "RUNNING":
-                suffix = f" ({players})" if players != "?" else ""
-                await client.change_presence(
-                    activity=discord.Game(f"PZ: RUNNING{suffix}"),
-                    status=discord.Status.online,
-                )
-            elif status == "STOPPED":
-                await client.change_presence(activity=discord.Game("PZ: STOPPED"), status=discord.Status.idle)
-            else:
-                await client.change_presence(activity=discord.Game("PZ: ?"), status=discord.Status.dnd)
-        except Exception:
-            pass
-
-        await asyncio.sleep(cfg.STATUS_REFRESH_SECONDS)
-
-
-# ------------------ Logscan monitor -> #bugs-reports ------------------
-def _parse_logscan_json(text: str) -> dict:
-    t = (text or "").strip()
-    if t.startswith("{") and t.endswith("}"):
-        return json.loads(t)
-    a = t.find("{")
-    b = t.rfind("}")
-    if a != -1 and b != -1 and b > a:
-        return json.loads(t[a : b + 1])
-    raise ValueError("Unable to parse JSON output from pz_logscan.ps1")
-
-
-async def post_console_alert(payload: dict) -> None:
-    if cfg.DISCORD_BUGS_CHANNEL_ID <= 0:
-        return
-
-    ch = client.get_channel(cfg.DISCORD_BUGS_CHANNEL_ID)
-    if ch is None:
-        ch = await client.fetch_channel(cfg.DISCORD_BUGS_CHANNEL_ID)
-
-    new_warn = _safe_int(payload.get("new_warn", 0))
-    new_error = _safe_int(payload.get("new_error", 0))
-    new_stack = _safe_int(payload.get("new_stack", 0))
-    ignored_total = _safe_int(payload.get("ignored_total", 0))
-    new_critical_count = _safe_int(payload.get("new_critical_count", 0))
-
-    s1 = payload.get("stats_1h") or {}
-    s24 = payload.get("stats_24h") or {}
-    s30 = payload.get("stats_30d") or {}
-
-    warn1 = _safe_int(s1.get("warn", 0))
-    err1 = _safe_int(s1.get("error", 0))
-    st1 = _safe_int(s1.get("stack", 0))
-    color, emoji = severity_style(warn1, err1, st1)
-
-    # Global pacing
-    global last_alert_sent_at
-    now = time.time()
-    if now - last_alert_sent_at < cfg.PZ_ALERT_MIN_INTERVAL_SECONDS:
-        return
-
-    # Dedup filter
-    dedup_window = float(cfg.PZ_LOG_DEDUP_SECONDS)
-    critical_lines = payload.get("new_critical_lines") or []
-
-    blocks: list[str] = []
-    sent_count = 0
-
-    for item in critical_lines:
-        if len(blocks) >= 2:
-            break
-        txt = str(item)
-
-        sig = critical_signature(txt)
-        last = dedup_seen.get(sig, 0.0)
-        if now - last < dedup_window:
-            continue
-
-        dedup_seen[sig] = now
-        blocks.append(_codeblock(txt, max_len=1200))
-        sent_count += 1
-
-    # Prune old dedup entries
-    for k, v in list(dedup_seen.items()):
-        if now - v > dedup_window * 2:
-            dedup_seen.pop(k, None)
-
-    if sent_count == 0:
-        # nothing new after dedup -> no alert
-        return
-
-    last_alert_sent_at = now
-
-    mention = cfg.DISCORD_PING_ON_UPDATE.strip()
-    mention_prefix = f"{mention}\n" if mention else ""
-
-    desc = (
-        f"**New critical:** `{new_critical_count}`  |  **Ignored:** `{ignored_total}`  |  **Sent:** `{sent_count}`\n"
-        f"**New WARN:** `{new_warn}`  **New ERROR:** `{new_error}`  **New STACK:** `{new_stack}`\n\n"
-        + ("\n".join(blocks) + "\n\n" if blocks else "")
-        + f"**Last 1h** — WARN `{warn1}`, ERROR `{err1}`, STACK `{st1}`\n"
-        + f"**Last 24h** — WARN `{_safe_int(s24.get('warn',0))}`, ERROR `{_safe_int(s24.get('error',0))}`, STACK `{_safe_int(s24.get('stack',0))}`\n"
-        + f"**Last 30d** — WARN `{_safe_int(s30.get('warn',0))}`, ERROR `{_safe_int(s30.get('error',0))}`, STACK `{_safe_int(s30.get('stack',0))}`\n"
-        + f"**Log:** `{payload.get('log_path','')}`"
-    )
-
-    emb = make_embed(f"{emoji} PZ — Console Alert", desc, color)
-    await ch.send(content=mention_prefix, embed=emb)
-
-
-async def monitor_console_loop():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        try:
-            code, out = await run_logscan()
-            if code == 0:
-                payload = _parse_logscan_json(out)
-                if _safe_int(payload.get("new_critical_count", 0)) > 0:
-                    await post_console_alert(payload)
-            else:
-                logger.warning("logscan non-zero exit: %s | %s", code, out[:200])
+            guild = discord.Object(id=cfg.DISCORD_GUILD_ID)
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+            logger.info("Slash commands synced to guild %s", cfg.DISCORD_GUILD_ID)
         except Exception as e:
-            logger.exception("monitor_console_loop failed: %s", e)
+            logger.exception("Slash sync failed: %s", e)
 
-        await asyncio.sleep(cfg.PZ_LOGSCAN_INTERVAL_SECONDS)
+
+intents = discord.Intents.default()
+intents.members = True
+
+client = PZBotClient(intents=intents)
+tree = app_commands.CommandTree(client)
+
+
+@client.event
+async def on_ready():
+    logger.info("Logged in as %s (id=%s)", client.user, client.user.id)
 
 
 # ------------------ Commands ------------------
-@tree.command(name="pz_version", description="Show bot version", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-async def pz_version(i: discord.Interaction):
-    emb = make_embed("PZ — Version", f"Version: `v{BOT_VERSION}`", SEV_BLUE)
-    await i.response.send_message(embed=emb, ephemeral=True)
-
-
-@tree.command(name="pz_ping", description="Bot healthcheck", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-async def pz_ping(i: discord.Interaction):
-    await i.response.send_message(embed=make_embed("PZ — Ping", "✅ Pong.", SEV_GREEN), ephemeral=True)
-
-
-@tree.command(name="pz_help", description="Commands + access rules", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_help", description="Show PZBot commands", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_help(i: discord.Interaction):
     desc = (
-        f"**PZBot v{BOT_VERSION}**\n\n"
-        "**Commands**\n"
-        "• `/pz_status` — server status + online players\n"
-        "• `/pz_players` — list online players\n"
-        "• `/pz_logstats` — console log stats (1h/24h/30d)\n"
-        "• `/pz_workshop_check` — workshop check (webhook)\n"
-        "• `/pz_save` — save world (sensitive)\n"
-        "• `/pz_stop` — stop server (sensitive, confirmation)\n"
-        "• `/pz_start` — start server (sensitive, confirmation)\n"
-        "• `/pz_restart` — restart server (sensitive, confirmation)\n"
-        "• `/pz_grant @user` — grant PZ role\n"
-        "• `/pz_revoke @user` — revoke PZ role\n"
-        "• `/pz_version` — bot version\n"
-        "• `/pz_ping` — healthcheck\n\n"
-        "**Monitoring**\n"
-        "• Console ERROR/STACK alerts are posted to **#bugs-reports**\n\n"
-        "**Access**\n"
-        f"• Required role: <@&{cfg.PZ_ADMIN_ROLE_ID}>\n"
-        "• OR Discord `Administrator`\n"
-        "• OR (if enabled) channel perms: `manage_guild` / `manage_channels` / `manage_messages`\n\n"
+        "**Core**\n"
+        "• `/pz_status` — Server status (with latency)\n"
+        "• `/pz_players` — Online players (with latency)\n"
+        "• `/pz_ping` — Bot ping (and server quick status)\n"
+        "• `/pz_version` — Bot version\n\n"
+        "**Chat**\n"
+        "• `/pz_say <message>` — Send a message to in-game chat (admin)\n\n"
+        "**Admin**\n"
+        "• `/pz_start` `/pz_stop` `/pz_restart`\n"
+        "• `/pz_save` — Save world (sensitive)\n"
+        "• `/pz_workshop_check` — Run workshop check now\n"
+        "• `/pz_grant @user` — Grant PZ role\n"
+        "• `/pz_revoke @user` — Revoke PZ role\n\n"
+        "**Logs**\n"
+        "• `/pz_logstats` — Log stats\n"
+        "• `/pz_logs_recent` — Recent critical excerpts\n"
+        "• `/pz_logs_top` — Top signatures\n\n"
+        "**Ignore list**\n"
+        "• `/pz_ignore_add <regex>`\n"
+        "• `/pz_ignore_remove <regex>`\n"
+        "• `/pz_ignore_list`\n\n"
         f"**Cooldown:** {cfg.COOLDOWN_SECONDS}s  |  **Confirm window:** {cfg.CONFIRM_SECONDS}s\n"
     )
     await i.response.send_message(embed=make_embed("PZ — Help", desc, SEV_BLUE), ephemeral=True)
 
 
-@tree.command(name="pz_status", description="Project Zomboid server status", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-async def pz_status(i: discord.Interaction):
-    await i.response.defer(ephemeral=True)
+@tree.command(name="pz_version", description="Show bot version", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_version(i: discord.Interaction):
+    env_ver = (os.environ.get("PZBOT_VERSION") or "").strip()
+    if env_ver and env_ver != cfg.BOT_VERSION:
+        desc = f"Config version: `{cfg.BOT_VERSION}`\nEnv override (PZBOT_VERSION): `{env_ver}`"
+    else:
+        desc = f"`{cfg.BOT_VERSION}`"
+    await i.response.send_message(embed=make_embed("PZ — Version", desc, SEV_BLUE), ephemeral=True)
 
+
+@tree.command(name="pz_ping", description="Bot ping (and server status)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_ping(i: discord.Interaction):
+    await i.response.defer(ephemeral=True, thinking=True)
+
+    bot_ms = int(client.latency * 1000)
+
+    t0 = time.perf_counter()
     code, out = await run_control("status")
+    srv_ms = int((time.perf_counter() - t0) * 1000)
+
     status, players = parse_status_with_players(out)
+    color = SEV_GREEN if code == 0 else SEV_RED
 
-    ok = (code == 0) and (status in ("RUNNING", "STOPPED"))
-    color = SEV_GREEN if ok else SEV_RED
-    desc = f"**Status:** `{status}`\n**Online players:** `{players}`"
+    desc = (
+        f"**Bot WS latency:** `{bot_ms}ms`\n"
+        f"**Server status:** `{status}` | **Players:** `{players}`\n"
+        f"**Server check latency:** `{srv_ms}ms`"
+    )
+    await i.followup.send(embed=make_embed("PZ — Ping", desc, color), ephemeral=True)
 
+
+@tree.command(name="pz_status", description="Show PZ server status", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_status(i: discord.Interaction):
+    await i.response.defer(ephemeral=True, thinking=True)
+
+    t0 = time.perf_counter()
+    code, out = await run_control("status")
+    dt_ms = int((time.perf_counter() - t0) * 1000)
+
+    status, players = parse_status_with_players(out)
+    color = SEV_GREEN if code == 0 else SEV_RED
+
+    desc = (
+        f"**Status:** `{status}` | **Players:** `{players}`\n"
+        f"**Latency:** `{dt_ms}ms`\n\n"
+        f"```{out}```"
+    )
     await i.followup.send(embed=make_embed("PZ — Status", desc, color), ephemeral=True)
 
 
-@tree.command(name="pz_players", description="List online players", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_players", description="Show online players", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_players(i: discord.Interaction):
-    await i.response.defer(ephemeral=True)
+    await i.response.defer(ephemeral=True, thinking=True)
 
+    t0 = time.perf_counter()
     code, out = await run_control("players")
-    t = (out or "").strip()
+    dt_ms = int((time.perf_counter() - t0) * 1000)
 
-    if "STOPPED" in t.upper():
-        await i.followup.send(embed=make_embed("PZ — Players", "Server is stopped.", SEV_RED), ephemeral=True)
+    # If script returns "(none)" that's fine; show it.
+    color = SEV_GREEN if code == 0 else SEV_RED
+    desc = f"**Latency:** `{dt_ms}ms`\n\n```{out}```"
+    await i.followup.send(embed=make_embed("PZ — Players", desc, color), ephemeral=True)
+
+
+@tree.command(name="pz_say", description="Send a message to in-game chat (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(message="Message to send to in-game chat")
+async def pz_say(i: discord.Interaction, message: str):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
         return
 
-    if t in ("(none)", ""):
-        await i.followup.send(embed=make_embed("PZ — Players", "No players online.", SEV_GREEN), ephemeral=True)
+    message = (message or "").strip()
+    if not message:
+        await i.response.send_message(embed=make_embed("PZ — Say", "Message cannot be empty.", SEV_RED), ephemeral=True)
         return
 
-    names = [line.strip() for line in t.splitlines() if line.strip()]
-    bullet_list = "\n".join([f"• `{n}`" for n in names])
+    await i.response.defer(ephemeral=True, thinking=True)
+    code, out = await run_powershell_script(cfg.POWERSHELL_EXE, cfg.PZ_CONTROL_PS1, ["-Action", "say", "-Message", message])
+    color = SEV_GREEN if code == 0 else SEV_RED
+    await i.followup.send(embed=make_embed("PZ — Say", f"```{out}```", color), ephemeral=True)
 
-    desc = f"**{len(names)} player(s) online:**\n{bullet_list}"
-    await i.followup.send(embed=make_embed("PZ — Players", desc, SEV_GREEN), ephemeral=True)
 
-
-@tree.command(name="pz_logstats", description="Show console log stats", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-async def pz_logstats(i: discord.Interaction):
-    await i.response.defer(ephemeral=True)
-
-    code, out = await run_logscan()
-    if code != 0:
-        await i.followup.send(embed=make_embed("PZ — Log Stats", f"Log scan failed:\n{_codeblock(out, 1200)}", SEV_RED), ephemeral=True)
+@tree.command(name="pz_workshop_check", description="Run workshop check now", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_workshop_check(i: discord.Interaction):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
         return
 
-    payload = _parse_logscan_json(out)
-    s1 = payload.get("stats_1h") or {}
-    s24 = payload.get("stats_24h") or {}
-    s30 = payload.get("stats_30d") or {}
-
-    warn = _safe_int(s1.get("warn", 0))
-    error = _safe_int(s1.get("error", 0))
-    stack = _safe_int(s1.get("stack", 0))
-    color, emoji = severity_style(warn, error, stack)
-
-    desc = (
-        f"**Last 1h** — WARN `{warn}`, ERROR `{error}`, STACK `{stack}`\n"
-        f"**Last 24h** — WARN `{_safe_int(s24.get('warn',0))}`, ERROR `{_safe_int(s24.get('error',0))}`, STACK `{_safe_int(s24.get('stack',0))}`\n"
-        f"**Last 30d** — WARN `{_safe_int(s30.get('warn',0))}`, ERROR `{_safe_int(s30.get('error',0))}`, STACK `{_safe_int(s30.get('stack',0))}`\n\n"
-        f"**Log:** `{payload.get('log_path','')}`"
-    )
-    emb = discord.Embed(title=f"{emoji} PZ — Log Stats", description=desc, color=color)
-    emb.timestamp = discord.utils.utcnow()
-    await i.followup.send(embed=emb, ephemeral=True)
+    await i.response.defer(ephemeral=True, thinking=True)
+    code, out = await run_workshop_check()
+    color = SEV_GREEN if code == 0 else SEV_RED
+    await i.followup.send(embed=make_embed("PZ — Workshop Check", f"```{out}```", color), ephemeral=True)
 
 
-@tree.command(name="pz_save", description="Save world now (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_save", description="Save world (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_save(i: discord.Interaction):
-    if await require_admin(cfg, i) is None:
-        return
-    if not cooldown.check(i.user.id, "save"):
-        await i.response.send_message(embed=make_embed("Cooldown", "Please wait before using `/pz_save` again.", SEV_ORANGE), ephemeral=True)
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
         return
 
-    await i.response.defer(ephemeral=True)
-    code, out = await run_control("save")
-    ok = (code == 0) and ("ERROR" not in out.upper())
-    await i.followup.send(embed=make_embed("PZ — Save", f"**Result:**\n{_codeblock(out, 1500)}", SEV_GREEN if ok else SEV_RED), ephemeral=True)
+    pending = PendingAction("save", time.time(), i.user.id)
 
+    async def do_confirm(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        code, out = await run_control("save")
+        color = SEV_GREEN if code == 0 else SEV_RED
+        await interaction.edit_original_response(embed=make_embed("PZ — Save", f"```{out}```", color), view=None)
 
-async def _confirm_and_run(i: discord.Interaction, action: str, title: str, enforce_nick: bool = False):
-    if await require_admin(cfg, i) is None:
-        return
-    if not cooldown.check(i.user.id, action):
-        await i.response.send_message(embed=make_embed("Cooldown", f"Please wait before using `{action}` again.", SEV_ORANGE), ephemeral=True)
-        return
-
-    pending = PendingAction(action=action, created_at=time.time(), interaction_user_id=i.user.id)
-
-    async def on_confirm(inter2: discord.Interaction):
-        await inter2.response.defer(ephemeral=True)
-        code, out = await run_control(action)
-        ok = (code == 0) and ("ERROR" not in out.upper())
-
-        if enforce_nick:
-            await ensure_bot_nickname()
-
-        await inter2.followup.send(
-            embed=make_embed(title, f"**Result:**\n{_codeblock(out, 1500)}", SEV_GREEN if ok else SEV_RED),
-            ephemeral=True,
-        )
-
-    view = ConfirmView(cfg, pending, on_confirm)
     await i.response.send_message(
-        embed=make_embed("Confirmation required", f"Confirm action: **{action.upper()}**", SEV_ORANGE),
-        view=view,
+        embed=make_embed("Confirm", "Save the world now?", SEV_ORANGE),
+        view=ConfirmView(cfg, pending, do_confirm),
         ephemeral=True,
     )
 
 
-@tree.command(name="pz_stop", description="Stop server (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-async def pz_stop(i: discord.Interaction):
-    await _confirm_and_run(i, "stop", "PZ — Stop", enforce_nick=False)
-
-
-@tree.command(name="pz_start", description="Start server (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_start", description="Start the PZ server (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_start(i: discord.Interaction):
-    await _confirm_and_run(i, "start", "PZ — Start", enforce_nick=True)
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    await i.response.defer(ephemeral=True, thinking=True)
+    code, out = await run_control("start")
+    color = SEV_GREEN if code == 0 else SEV_RED
+    await i.followup.send(embed=make_embed("PZ — Start", f"```{out}```", color), ephemeral=True)
 
 
-@tree.command(name="pz_restart", description="Restart server (sensitive)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@tree.command(name="pz_stop", description="Stop the PZ server (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_stop(i: discord.Interaction):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    pending = PendingAction("stop", time.time(), i.user.id)
+
+    async def do_confirm(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        code, out = await run_control("stop")
+        color = SEV_GREEN if code == 0 else SEV_RED
+        await interaction.edit_original_response(embed=make_embed("PZ — Stop", f"```{out}```", color), view=None)
+
+    await i.response.send_message(
+        embed=make_embed("Confirm", "Stop the server?", SEV_ORANGE),
+        view=ConfirmView(cfg, pending, do_confirm),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="pz_restart", description="Restart the PZ server (admin)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_restart(i: discord.Interaction):
-    await _confirm_and_run(i, "restart", "PZ — Restart", enforce_nick=True)
-
-
-@tree.command(name="pz_workshop_check", description="Check Workshop updates (webhook)", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-async def pz_workshop_check(i: discord.Interaction):
-    if await require_admin(cfg, i) is None:
-        return
-    if not cooldown.check(i.user.id, "workshop_check"):
-        await i.response.send_message(embed=make_embed("Cooldown", "Please wait before running the check again.", SEV_ORANGE), ephemeral=True)
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
         return
 
-    await i.response.defer(ephemeral=True)
-    code, out = await run_workshop_check()
+    pending = PendingAction("restart", time.time(), i.user.id)
 
-    ok = (code == 0)
-    msg = "✅ Workshop check triggered via webhook." if ok else f"❌ Workshop check failed:\n{_codeblock(out, 1500)}"
-    await i.followup.send(embed=make_embed("PZ — Workshop Check", msg, SEV_GREEN if ok else SEV_RED), ephemeral=True)
+    async def do_confirm(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        code, out = await run_control("restart")
+        color = SEV_GREEN if code == 0 else SEV_RED
+        await interaction.edit_original_response(embed=make_embed("PZ — Restart", f"```{out}```", color), view=None)
 
+    await i.response.send_message(
+        embed=make_embed("Confirm", "Restart the server?", SEV_ORANGE),
+        view=ConfirmView(cfg, pending, do_confirm),
+        ephemeral=True,
+    )
 
-@tree.command(name="pz_grant", description="Grant the PZ role to a user", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-@app_commands.describe(user="User to grant access")
+@tree.command(name="pz_grant", description="Grant PZ role", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(user="User to grant the role to")
 async def pz_grant(i: discord.Interaction, user: discord.Member):
-    if await require_admin(cfg, i) is None:
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
         return
 
-    async def do_grant(inter2: discord.Interaction):
-        role = inter2.guild.get_role(cfg.PZ_ADMIN_ROLE_ID) if inter2.guild else None
-        if role is None:
-            await inter2.response.send_message(embed=make_embed("Grant", "Role not found (wrong ID?).", SEV_RED), ephemeral=True)
-            return
-        await user.add_roles(role, reason=f"pz_grant by {user_tag(i)}")
-        audit_log(cfg, f"grant role={role.id} target={user.id} by={i.user.id}")
-        await inter2.response.send_message(embed=make_embed("Grant", f"✅ Role **{role.name}** granted to {user.mention}.", SEV_GREEN), ephemeral=True)
-
-    view = ConfirmView(cfg, PendingAction("grant", time.time(), i.user.id), do_grant)
-    await i.response.send_message(embed=make_embed("Confirmation required", f"Grant PZ role to {user.mention}?", SEV_ORANGE), view=view, ephemeral=True)
-
-
-@tree.command(name="pz_revoke", description="Revoke the PZ role from a user", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-@app_commands.describe(user="User to revoke access from")
-async def pz_revoke(i: discord.Interaction, user: discord.Member):
-    if await require_admin(cfg, i) is None:
+    if cfg.PZ_ADMIN_ROLE_ID <= 0 or i.guild is None:
+        await i.response.send_message(embed=make_embed("PZ — Grant", "PZ_ADMIN_ROLE_ID is not set.", SEV_RED), ephemeral=True)
         return
 
-    async def do_revoke(inter2: discord.Interaction):
-        role = inter2.guild.get_role(cfg.PZ_ADMIN_ROLE_ID) if inter2.guild else None
-        if role is None:
-            await inter2.response.send_message(embed=make_embed("Revoke", "Role not found (wrong ID?).", SEV_RED), ephemeral=True)
-            return
-        await user.remove_roles(role, reason=f"pz_revoke by {user_tag(i)}")
-        audit_log(cfg, f"revoke role={role.id} target={user.id} by={i.user.id}")
-        await inter2.response.send_message(embed=make_embed("Revoke", f"✅ Role **{role.name}** revoked from {user.mention}.", SEV_GREEN), ephemeral=True)
+    role = i.guild.get_role(cfg.PZ_ADMIN_ROLE_ID)
+    if role is None:
+        await i.response.send_message(embed=make_embed("PZ — Grant", "Role not found in this guild.", SEV_RED), ephemeral=True)
+        return
 
-    view = ConfirmView(cfg, PendingAction("revoke", time.time(), i.user.id), do_revoke)
-    await i.response.send_message(embed=make_embed("Confirmation required", f"Revoke PZ role from {user.mention}?", SEV_ORANGE), view=view, ephemeral=True)
-
-
-# ------------------ Events ------------------
-@client.event
-async def on_ready():
-    logger.info("✅ Bot ready as %s (id=%s)", client.user, client.user.id)
-    logger.info("✅ Guild ID: %s", cfg.DISCORD_GUILD_ID)
-
+    await i.response.defer(ephemeral=True, thinking=True)
     try:
-        await tree.sync(guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
-        logger.info("✅ Commands synced (guild scoped).")
-    except Exception as e:
-        logger.exception("Command sync failed: %s", e)
-
-    # Enforce nickname on startup
-    await ensure_bot_nickname()
-
-    client.loop.create_task(update_presence_loop())
-    client.loop.create_task(monitor_console_loop())
+        await user.add_roles(role, reason=f"PZBot grant by {user_tag(i)}")
+        await i.followup.send(embed=make_embed("PZ — Grant", f"Granted {role.mention} to {user.mention}", SEV_GREEN), ephemeral=True)
+    except discord.Forbidden:
+        await i.followup.send(embed=make_embed("PZ — Grant", "Forbidden: permission/role hierarchy issue.", SEV_RED), ephemeral=True)
 
 
-# ------------------ Run ------------------
-client.run(cfg.DISCORD_BOT_TOKEN)
+@tree.command(name="pz_revoke", description="Revoke PZ role", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(user="User to revoke the role from")
+async def pz_revoke(i: discord.Interaction, user: discord.Member):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    if cfg.PZ_ADMIN_ROLE_ID <= 0 or i.guild is None:
+        await i.response.send_message(embed=make_embed("PZ — Revoke", "PZ_ADMIN_ROLE_ID is not set.", SEV_RED), ephemeral=True)
+        return
+
+    role = i.guild.get_role(cfg.PZ_ADMIN_ROLE_ID)
+    if role is None:
+        await i.response.send_message(embed=make_embed("PZ — Revoke", "Role not found in this guild.", SEV_RED), ephemeral=True)
+        return
+
+    await i.response.defer(ephemeral=True, thinking=True)
+    try:
+        await user.remove_roles(role, reason=f"PZBot revoke by {user_tag(i)}")
+        await i.followup.send(embed=make_embed("PZ — Revoke", f"Revoked {role.mention} from {user.mention}", SEV_GREEN), ephemeral=True)
+    except discord.Forbidden:
+        await i.followup.send(embed=make_embed("PZ — Revoke", "Forbidden: permission/role hierarchy issue.", SEV_RED), ephemeral=True)
+
+
+# ------------------ Ignore list ------------------
+@tree.command(name="pz_ignore_list", description="List ignore regex patterns", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_ignore_list(i: discord.Interaction):
+    patterns = load_ignore_patterns()
+    if not patterns:
+        await i.response.send_message(embed=make_embed("PZ — Ignore List", "(empty)", SEV_BLUE), ephemeral=True)
+        return
+
+    txt = "\n".join(f"{idx+1}. `{p}`" for idx, p in enumerate(patterns))
+    await i.response.send_message(embed=make_embed("PZ — Ignore List", txt, SEV_BLUE), ephemeral=True)
+
+
+@tree.command(name="pz_ignore_add", description="Add ignore regex pattern", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(regex="Regex pattern to ignore")
+async def pz_ignore_add(i: discord.Interaction, regex: str):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    regex = (regex or "").strip()
+    if not regex:
+        await i.response.send_message(embed=make_embed("PZ — Ignore Add", "Regex cannot be empty.", SEV_RED), ephemeral=True)
+        return
+
+    err = validate_regex(regex)
+    if err:
+        await i.response.send_message(embed=make_embed("PZ — Ignore Add", f"Invalid regex: `{err}`", SEV_RED), ephemeral=True)
+        return
+
+    patterns = load_ignore_patterns()
+    if regex in patterns:
+        await i.response.send_message(embed=make_embed("PZ — Ignore Add", "Already exists.", SEV_BLUE), ephemeral=True)
+        return
+
+    patterns.append(regex)
+    save_ignore_patterns(patterns)
+    await i.response.send_message(embed=make_embed("PZ — Ignore Add", f"Added: `{regex}`", SEV_GREEN), ephemeral=True)
+
+
+@tree.command(name="pz_ignore_remove", description="Remove ignore regex pattern", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+@app_commands.describe(regex="Regex pattern to remove")
+async def pz_ignore_remove(i: discord.Interaction, regex: str):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    regex = (regex or "").strip()
+    patterns = load_ignore_patterns()
+
+    if regex not in patterns:
+        await i.response.send_message(embed=make_embed("PZ — Ignore Remove", "Not found.", SEV_RED), ephemeral=True)
+        return
+
+    patterns = [p for p in patterns if p != regex]
+    save_ignore_patterns(patterns)
+    await i.response.send_message(embed=make_embed("PZ — Ignore Remove", f"Removed: `{regex}`", SEV_GREEN), ephemeral=True)
+
+
+# ------------------ Logs ------------------
+@tree.command(name="pz_logstats", description="Log stats", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_logstats(i: discord.Interaction):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    await i.response.defer(ephemeral=True, thinking=True)
+    code, out = await run_logscan()
+    color = SEV_GREEN if code == 0 else SEV_RED
+    await i.followup.send(embed=make_embed("PZ — Log Stats", f"```{out}```", color), ephemeral=True)
+
+
+@tree.command(name="pz_logs_recent", description="Recent critical excerpts", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_logs_recent(i: discord.Interaction):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    await i.response.defer(ephemeral=True, thinking=True)
+    code, out = await run_logscan()
+    color = SEV_GREEN if code == 0 else SEV_RED
+    await i.followup.send(embed=make_embed("PZ — Recent Logs", f"```{out}```", color), ephemeral=True)
+
+
+@tree.command(name="pz_logs_top", description="Top signatures", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
+async def pz_logs_top(i: discord.Interaction):
+    m = await require_admin(cfg, i)
+    if await deny_if_needed(i, m):
+        return
+
+    await i.response.defer(ephemeral=True, thinking=True)
+    code, out = await run_logscan()
+    color = SEV_GREEN if code == 0 else SEV_RED
+    await i.followup.send(embed=make_embed("PZ — Top Signatures", f"```{out}```", color), ephemeral=True)
+
+
+# ------------------ Presence loop (optional) ------------------
+async def update_presence_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            code, out = await run_control("status")
+            status, players = parse_status_with_players(out)
+            if status == "RUNNING":
+                await client.change_presence(activity=discord.Game(name=f"PZ RUNNING • {players} players"))
+            else:
+                await client.change_presence(activity=discord.Game(name=f"PZ {status}"))
+        except Exception:
+            logger.exception("Presence update failed")
+        await asyncio.sleep(max(10, int(cfg.STATUS_REFRESH_SECONDS)))
+
+
+@client.event
+async def on_connect():
+    # Start after connect
+    try:
+        client.loop.create_task(update_presence_loop())
+    except Exception:
+        pass
+
+
+# ------------------ Entrypoint ------------------
+def main():
+    if not cfg.DISCORD_BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN is missing.")
+    client.run(cfg.DISCORD_BOT_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
