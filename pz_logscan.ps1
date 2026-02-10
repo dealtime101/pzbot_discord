@@ -293,7 +293,7 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
       ts = ($dt.ToString("o"))
       type = "error"
       signature = (Make-Signature "error" $line)
-      excerpt = ($line.Length -gt 600 ? $line.Substring(0,600) : $line)
+      excerpt = $(if ($line.Length -gt 600) { $line.Substring(0,600) } else { $line })
     }
   }
 
@@ -340,7 +340,7 @@ for ($i = 0; $i -lt $newLines.Count; $i++) {
       ts = ($dt.ToString("o"))
       type = "stack"
       signature = (Make-Signature "stack" $blockText)
-      excerpt = ($blockText.Length -gt 900 ? $blockText.Substring(0,900) : $blockText)
+      excerpt = $(if ($blockText.Length -gt 900) { $blockText.Substring(0,900) } else { $blockText })
     }
   }
 }
