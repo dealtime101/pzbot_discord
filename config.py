@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 # SemVer (also overridable via env PZBOT_VERSION)
-BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.7").strip() or "1.3.7"
+BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.8").strip() or "1.3.8"
 
 
 def _getenv_raw(name: str, default: str | None = None) -> str | None:
