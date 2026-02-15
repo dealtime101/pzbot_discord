@@ -1,12 +1,11 @@
-# config.py
+﻿# config.py
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
 
-# SemVer (also overridable via env PZBOT_VERSION)
-BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.8").strip() or "1.3.8"
+BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.8.2").strip() or "1.3.8.2"
 
 
 def _getenv_raw(name: str, default: str | None = None) -> str | None:
@@ -25,13 +24,6 @@ def _env_required(name: str) -> str:
 
 
 def _parse_discord_id(value: str, var_name: str) -> int:
-    """
-    Accepts:
-      - 725383719455817758
-      - <725383719455817758>
-      - <@725383719455817758>
-      - <@&725383719455817758>
-    """
     m = re.search(r"\d+", value)
     if not m:
         raise ValueError(f"{var_name} must contain a numeric ID (got: {value!r})")
@@ -131,6 +123,8 @@ def load_config() -> Config:
         ALLOW_CHANNEL_PERMS=_env_bool("PZ_ALLOW_CHANNEL_PERMS", True),
         CONFIRM_SECONDS=_env_int("PZ_CONFIRM_SECONDS", 20),
         COOLDOWN_SECONDS=_env_int("PZ_COOLDOWN_SECONDS", 10),
+
+        # ✅ presence rotation interval
         STATUS_REFRESH_SECONDS=_env_int("PZ_STATUS_REFRESH_SECONDS", 30),
 
         # Logging
