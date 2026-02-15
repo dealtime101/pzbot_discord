@@ -582,7 +582,7 @@ async def on_ready():
 async def update_presence_loop():
     await client.wait_until_ready()
 
-    interval = max(10, int(cfg.STATUS_REFRESH_SECONDS))  # default 30
+    interval = max(10, int(cfg.STATUS_REFRESH_SECONDS))
     idx = 0
 
     while not client.is_closed():
@@ -591,38 +591,44 @@ async def update_presence_loop():
             status, players = parse_status_with_players(out)
 
             if code != 0:
-                # if status command fails, keep it simple
-                await client.change_presence(activity=discord.Game(name="⚠️ PZ STATUS ERROR"))
+                await client.change_presence(
+                    activity=discord.Game(name="⚠️ PZ ERROR")
+                )
                 await asyncio.sleep(interval)
                 continue
 
-            # Build rotating lines (as requested)
-            if status == "RUNNING":
+            # Normalize status
+            normalized = "ONLINE" if status == "RUNNING" else status
+
+            players_display = players if players != "?" else "?"
+
+            if normalized == "ONLINE":
                 lines = [
-                    f"🟢 PZ RUNNING : /pz_help",
-                    f"🟢 PZ RUNNING : 👥 {players}",
-                    f"🟢 PZ RUNNING : /pz_status",
-                    f"🟢 PZ RUNNING : 👥 {players}",
-                    f"🟢 PZ RUNNING : /pz_version",
+                    f"🟢 ONLINE : /pz_help",
+                    f"🟢 ONLINE : 👥 {players_display}",
+                    f"🟢 ONLINE : /pz_status",
+                    f"🟢 ONLINE : 👥 {players_display}",
+                    f"🟢 ONLINE : /pz_version",
                 ]
             else:
-                # For non-running states, still rotate but keep useful hints
                 lines = [
-                    f"🔴 PZ {status} : /pz_status",
-                    f"🔴 PZ {status} : 👥 {players}",
-                    f"🔴 PZ {status} : /pz_help",
-                    f"🔴 PZ {status} : 👥 {players}",
-                    f"🔴 PZ {status} : /pz_version",
+                    f"🔴 {normalized} : /pz_status",
+                    f"🔴 {normalized} : 👥 {players_display}",
+                    f"🔴 {normalized} : /pz_help",
+                    f"🔴 {normalized} : 👥 {players_display}",
+                    f"🔴 {normalized} : /pz_version",
                 ]
 
-            msg = lines[idx % len(lines)]
+            await client.change_presence(
+                activity=discord.Game(name=lines[idx % len(lines)])
+            )
             idx += 1
-            await client.change_presence(activity=discord.Game(name=msg))
 
         except Exception:
             logger.exception("Presence update failed")
 
         await asyncio.sleep(interval)
+
 
 
 # ------------------ Commands ------------------
@@ -653,7 +659,11 @@ async def pz_help(i: discord.Interaction):
 
 @tree.command(name="pz_version", description="Show bot version", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
 async def pz_version(i: discord.Interaction):
-    await i.response.send_message(embed=make_embed("🏷️ PZ — Version", f"`{cfg.BOT_VERSION}`", SEV_BLUE), ephemeral=True, allowed_mentions=_no_mentions())
+    await i.response.send_message(
+        embed=make_embed("🏷️ PZ — Version", f"`{cfg.BOT_VERSION}`", 0x3498DB),
+        ephemeral=True,
+    )
+
 
 
 @tree.command(name="pz_ping", description="Bot ping", guild=discord.Object(id=cfg.DISCORD_GUILD_ID))
