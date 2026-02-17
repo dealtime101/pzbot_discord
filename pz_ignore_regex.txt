@@ -4,4 +4,3 @@ PacketTypes.*AnimalPacket
 ERROR:\s+template
 AnimalEventPacket
 PacketTypes\$\PacketType
-Simon est un noob
