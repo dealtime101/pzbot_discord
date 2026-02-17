@@ -1,12 +1,11 @@
-# config.py
+﻿# config.py
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
 
-# SemVer (also overridable via env PZBOT_VERSION)
-BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.7").strip() or "1.3.7"
+BOT_VERSION = os.environ.get("PZBOT_VERSION", "1.3.8.4").strip() or "1.3.8.4"
 
 
 def _getenv_raw(name: str, default: str | None = None) -> str | None:
@@ -25,13 +24,6 @@ def _env_required(name: str) -> str:
 
 
 def _parse_discord_id(value: str, var_name: str) -> int:
-    """
-    Accepts:
-      - 725383719455817758
-      - <725383719455817758>
-      - <@725383719455817758>
-      - <@&725383719455817758>
-    """
     m = re.search(r"\d+", value)
     if not m:
         raise ValueError(f"{var_name} must contain a numeric ID (got: {value!r})")
@@ -73,6 +65,7 @@ class Config:
     DISCORD_BUGS_CHANNEL_ID: int
     PZ_LOGSCAN_PS1: str
     PZ_CONSOLE_LOG: str
+    PZ_LOGSCAN_STATE_DIR: str
     PZ_LOGSCAN_INTERVAL_SECONDS: int
     PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS: int
     PZ_LOGSCAN_DEDUP_SECONDS: int
@@ -114,6 +107,7 @@ def load_config() -> Config:
         DISCORD_BUGS_CHANNEL_ID=_env_int("DISCORD_BUGS_CHANNEL_ID", 0),
         PZ_LOGSCAN_PS1=_env_str("PZ_LOGSCAN_PS1", rf"{base}\pz_logscan.ps1"),
         PZ_CONSOLE_LOG=_env_str("PZ_CONSOLE_LOG", rf"{base}\hh_saves\Zomboid\server-console.txt"),
+        PZ_LOGSCAN_STATE_DIR=_env_str("PZ_LOGSCAN_STATE_DIR", r"C:\PZ_MaintenanceLogs\PZLogScan"),
         PZ_LOGSCAN_INTERVAL_SECONDS=_env_int("PZ_LOGSCAN_INTERVAL_SECONDS", 25),
         PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS=_env_int("PZ_LOGSCAN_ALERT_COOLDOWN_SECONDS", 30),
         PZ_LOGSCAN_DEDUP_SECONDS=_env_int("PZ_LOGSCAN_DEDUP_SECONDS", 600),
